@@ -1,0 +1,7 @@
+﻿Nano experiment backup
+Created: 2026-06-02 16:53:06 IST
+Source: C:\Users\sharm\Downloads\tr_alert
+Purpose: isolated copy for testing GPT-5.4 nano accuracy without changing the active GPT-5.4 mini high project.
+Included: code, AGENTS.md, .env, tests, local DB/state files, downloads PDF folder, codex_history.txt.
+Excluded: output, logs, screenshots, __pycache__, old architecture, *.pyc, debug.log.
+Run Codex from this folder for the nano experiment: C:\Users\sharm\Downloads\tr_alert_gpt54_nano_experiment_20260602_165306
