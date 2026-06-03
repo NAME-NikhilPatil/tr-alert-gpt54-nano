@@ -43,19 +43,20 @@ jobs:
           echo "Current Azure account:"
           az account show --query "{name:name, subscriptionId:id, tenantId:tenantId}" --output table
 
-          echo "Using resource group from GitHub secret:"
-          echo "${{ secrets.AZURE_RESOURCE_GROUP }}"
-
-          echo "Using container app name from GitHub secret:"
-          echo "${{ secrets.AZURE_CONTAINER_APP_NAME }}"
-
-      - name: Debug Azure Container Apps
-        run: |
           echo "Listing container apps in resource group..."
           az containerapp list \
             --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
             --query "[].{name:name, resourceGroup:resourceGroup, location:location}" \
             --output table
+
+      - name: Configure Container App registry authentication
+        run: |
+          az containerapp registry set \
+            --name ${{ secrets.AZURE_CONTAINER_APP_NAME }} \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --server ${{ secrets.AZURE_REGISTRY_LOGIN_SERVER }} \
+            --username ${{ secrets.AZURE_REGISTRY_USERNAME }} \
+            --password ${{ secrets.AZURE_REGISTRY_PASSWORD }}
 
       - name: Deploy image to Azure Container App
         run: |
