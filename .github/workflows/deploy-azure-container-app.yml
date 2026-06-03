@@ -38,6 +38,25 @@ jobs:
           docker push ${{ secrets.AZURE_REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ secrets.AZURE_REGISTRY_LOGIN_SERVER }}/${{ env.IMAGE_NAME }}:latest
 
+      - name: Debug Azure Context
+        run: |
+          echo "Current Azure account:"
+          az account show --query "{name:name, subscriptionId:id, tenantId:tenantId}" --output table
+
+          echo "Using resource group from GitHub secret:"
+          echo "${{ secrets.AZURE_RESOURCE_GROUP }}"
+
+          echo "Using container app name from GitHub secret:"
+          echo "${{ secrets.AZURE_CONTAINER_APP_NAME }}"
+
+      - name: Debug Azure Container Apps
+        run: |
+          echo "Listing container apps in resource group..."
+          az containerapp list \
+            --resource-group ${{ secrets.AZURE_RESOURCE_GROUP }} \
+            --query "[].{name:name, resourceGroup:resourceGroup, location:location}" \
+            --output table
+
       - name: Deploy image to Azure Container App
         run: |
           az containerapp update \
