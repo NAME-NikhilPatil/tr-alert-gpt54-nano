@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from datetime import date
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,25 @@ from utils import NSE_BASE_URL, NSE_HEADERS, absolutize_url, exchange_date, requ
 
 NSE_ANNOUNCEMENTS_URL = "https://www.nseindia.com/companies-listing/corporate-filings-announcements"
 NSE_API_URL = "https://www.nseindia.com/api/corporate-announcements"
+NSE_CHROME_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"
+)
+NSE_EXTRA_HEADERS = {
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,application/json,text/plain,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+    "Referer": "https://www.nseindia.com/",
+}
+NSE_CHROMIUM_ARGS = [
+    "--no-sandbox",
+    "--disable-dev-shm-usage",
+    "--disable-gpu",
+    "--disable-blink-features=AutomationControlled",
+    "--disable-http2",
+    "--ignore-certificate-errors",
+]
 
 
 async def fetch_nse_announcements(run_date: date) -> list[Announcement]:
@@ -26,22 +46,29 @@ async def fetch_nse_announcements(run_date: date) -> list[Announcement]:
         announcements = await _fetch_nse_via_api(run_date)
         if announcements:
             return announcements
+    except httpx.HTTPStatusError as exc:
+        status = exc.response.status_code if exc.response is not None else 0
+        if status == 403:
+            logging.warning("NSE API path returned HTTP 403; falling back to browser scraping.")
+        else:
+            logging.exception("NSE API path failed with HTTP %s; falling back to browser scraping.", status)
     except Exception:
         logging.exception("NSE API path failed; falling back to browser scraping.")
     try:
         return await _fetch_nse_via_browser(run_date)
-    except Exception:
-        logging.exception("NSE browser path failed.")
+    except Exception as exc:
+        logging.error("NSE browser path failed after retries; returning no NSE announcements: %s", exc)
         return []
 
 
 async def _fetch_nse_via_api(run_date: date) -> list[Announcement]:
     """Fetch NSE corporate announcements through the JSON endpoint."""
 
-    async with httpx.AsyncClient(headers=NSE_HEADERS, follow_redirects=True, timeout=45) as client:
-        await request_with_retries(client, "GET", NSE_BASE_URL, headers=NSE_HEADERS)
+    headers = _nse_request_headers(accept_json=True)
+    async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=45) as client:
+        await request_with_retries(client, "GET", NSE_BASE_URL, headers=headers)
         for params in _nse_api_param_sets(run_date):
-            response = await request_with_retries(client, "GET", NSE_API_URL, params=params, headers=NSE_HEADERS)
+            response = await request_with_retries(client, "GET", NSE_API_URL, params=params, headers=headers)
             try:
                 payload = response.json()
             except ValueError:
@@ -101,62 +128,129 @@ async def _fetch_nse_via_browser(run_date: date) -> list[Announcement]:
     """Scrape NSE announcements from the browser-rendered table."""
 
     async with async_playwright() as playwright:
-        browser = await playwright.chromium.launch(headless=True)
-        context = await browser.new_context(
-            user_agent=NSE_HEADERS["User-Agent"],
-            locale="en-US",
-            extra_http_headers=NSE_HEADERS,
-        )
-        page = await context.new_page()
-        await apply_stealth(page)
-        captured: list[dict[str, Any]] = []
-
-        async def capture_response(response: Any) -> None:
-            """Capture NSE announcement JSON responses emitted by the page."""
-
-            if "corporate-announcements" not in response.url:
-                return
-            try:
-                payload = await response.json()
-                rows = payload if isinstance(payload, list) else payload.get("data", [])
-                captured.extend(rows)
-            except Exception:
-                logging.debug("Ignored non-JSON NSE response: %s", response.url)
-
-        page.on("response", capture_response)
-        await page.goto(NSE_ANNOUNCEMENTS_URL, wait_until="networkidle", timeout=90000)
-        await _nse_set_date_filters(page, run_date)
-        await page.wait_for_timeout(5000)
-
-        announcements = [_nse_row_to_announcement(row) for row in captured]
-        announcements = [item for item in announcements if item and _is_outcome_subject(item.subject)]
-        if announcements:
-            await browser.close()
-            return _dedupe_announcements(announcements)
-
-        table_rows = await page.locator("table tbody tr").all()
-        browser_announcements: list[Announcement] = []
-        for row in table_rows:
-            cells = [cell.strip() for cell in await row.locator("td").all_inner_texts()]
-            if len(cells) < 6 or not _is_outcome_subject(" ".join(cells)):
-                continue
-            pdf_url = ""
-            pdf_link = row.locator("a[href*='.pdf'], a:has-text('PDF')").first
-            if await pdf_link.count():
-                pdf_url = absolutize_url(await pdf_link.get_attribute("href") or "", NSE_BASE_URL)
-            browser_announcements.append(
-                Announcement(
-                    source="NSE",
-                    company_name=cells[1],
-                    identifier=cells[0],
-                    subject=cells[2],
-                    details=cells[3] if len(cells) > 3 else "",
-                    pdf_url=pdf_url,
-                    announcement_datetime=cells[-1],
-                )
+        browser = await playwright.chromium.launch(headless=True, args=NSE_CHROMIUM_ARGS)
+        try:
+            context = await browser.new_context(
+                user_agent=NSE_CHROME_USER_AGENT,
+                viewport={"width": 1366, "height": 768},
+                locale="en-US",
+                timezone_id="Asia/Kolkata",
+                accept_downloads=True,
+                ignore_https_errors=True,
+                extra_http_headers=_nse_request_headers(),
             )
-        await browser.close()
-        return _dedupe_announcements(browser_announcements)
+            page = await context.new_page()
+            await apply_stealth(page)
+            await _install_nse_resource_blocking(page)
+            captured: list[dict[str, Any]] = []
+
+            async def capture_response(response: Any) -> None:
+                """Capture NSE announcement JSON responses emitted by the page."""
+
+                if "corporate-announcements" not in response.url:
+                    return
+                try:
+                    payload = await response.json()
+                    rows = payload if isinstance(payload, list) else payload.get("data", [])
+                    if isinstance(rows, list):
+                        captured.extend(row for row in rows if isinstance(row, dict))
+                except Exception:
+                    logging.debug("Ignored non-JSON NSE response: %s", response.url)
+
+            page.on("response", capture_response)
+            await _warm_nse_home_page(page)
+            try:
+                await safe_goto_nse(page, NSE_ANNOUNCEMENTS_URL, timeout=90000)
+            except Exception as exc:
+                logging.warning("NSE announcements page navigation failed; retrying via home page first: %s", exc)
+                await _warm_nse_home_page(page)
+                await safe_goto_nse(page, NSE_ANNOUNCEMENTS_URL, timeout=90000)
+            await _nse_human_delay(page, 1800, 3200)
+            await _nse_set_date_filters(page, run_date)
+            await _nse_human_delay(page, 3500, 5500)
+
+            announcements = [_nse_row_to_announcement(row) for row in captured]
+            announcements = [item for item in announcements if item and _is_outcome_subject(item.subject)]
+            if announcements:
+                return _dedupe_announcements(announcements)
+
+            table_rows = await page.locator("table tbody tr").all()
+            browser_announcements: list[Announcement] = []
+            for row in table_rows:
+                cells = [cell.strip() for cell in await row.locator("td").all_inner_texts()]
+                if len(cells) < 6 or not _is_outcome_subject(" ".join(cells)):
+                    continue
+                pdf_url = ""
+                pdf_link = row.locator("a[href*='.pdf'], a:has-text('PDF')").first
+                if await pdf_link.count():
+                    pdf_url = absolutize_url(await pdf_link.get_attribute("href") or "", NSE_BASE_URL)
+                browser_announcements.append(
+                    Announcement(
+                        source="NSE",
+                        company_name=cells[1],
+                        identifier=cells[0],
+                        subject=cells[2],
+                        details=cells[3] if len(cells) > 3 else "",
+                        pdf_url=pdf_url,
+                        announcement_datetime=cells[-1],
+                    )
+                )
+            return _dedupe_announcements(browser_announcements)
+        finally:
+            await browser.close()
+
+
+async def safe_goto_nse(page: Any, url: str, timeout: int) -> Any:
+    """Navigate to an NSE page using staged waits that work better in containers."""
+
+    last_error: Exception | None = None
+    for wait_until in ("domcontentloaded", "load", "commit"):
+        try:
+            logging.info("NSE browser goto url=%s wait_until=%s", url, wait_until)
+            return await page.goto(url, wait_until=wait_until, timeout=timeout)
+        except Exception as exc:
+            last_error = exc
+            logging.warning("NSE browser goto failed url=%s wait_until=%s error=%s", url, wait_until, exc)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"NSE browser goto failed without captured error: {url}")
+
+
+async def _warm_nse_home_page(page: Any) -> None:
+    """Load NSE home page once to establish cookies before the announcements page."""
+
+    await safe_goto_nse(page, NSE_BASE_URL, timeout=60000)
+    await _nse_human_delay(page, 3000, 4200)
+
+
+async def _nse_human_delay(page: Any, minimum_ms: int, maximum_ms: int) -> None:
+    """Sleep for a small randomized delay without blocking the event loop."""
+
+    await page.wait_for_timeout(random.randint(minimum_ms, maximum_ms))
+
+
+async def _install_nse_resource_blocking(page: Any) -> None:
+    """Block heavyweight resources while preserving scripts and XHR/fetch."""
+
+    async def route_handler(route: Any) -> None:
+        resource_type = route.request.resource_type
+        if resource_type in {"image", "media", "font"}:
+            await route.abort()
+            return
+        await route.continue_()
+
+    await page.route("**/*", route_handler)
+
+
+def _nse_request_headers(*, accept_json: bool = False) -> dict[str, str]:
+    """Return NSE request headers suitable for Azure/container traffic."""
+
+    headers = dict(NSE_HEADERS)
+    headers.update(NSE_EXTRA_HEADERS)
+    headers["User-Agent"] = NSE_CHROME_USER_AGENT
+    if accept_json:
+        headers["Accept"] = "application/json, text/plain, */*"
+    return headers
 
 
 async def _nse_set_date_filters(page: Any, run_date: date) -> None:
