@@ -16,6 +16,7 @@ from multiprocessing import get_context
 from pathlib import Path
 from queue import Empty
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from bse_scraper import download_bse_pdf, fetch_bse_announcements
 from db_manager import deactivate_telegram_subscriber
@@ -71,6 +72,7 @@ except Exception:  # pragma: no cover - handled at runtime when dependency is mi
     load_dotenv = None
 
 DEFAULT_PDF_PARSE_TIMEOUT_SECONDS = 75
+EXCHANGE_TIMEZONE = ZoneInfo("Asia/Kolkata")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -464,7 +466,7 @@ async def _poll_once(
 ) -> tuple[int, int]:
     """Run one live polling pass and enqueue discovered PDFs only."""
 
-    today = datetime.now().date()
+    today = _exchange_today()
     announcements: list[Announcement] = []
     nse_items = await fetch_nse_announcements(today)
     bse_items = await fetch_bse_announcements(today)
@@ -546,6 +548,19 @@ def _process_live_pdf_job(
     announcement = job_to_announcement(job)
     timings: dict[str, float] = {}
     try:
+        if not _queued_job_is_current(announcement):
+            runtime.log_event("PDF_PROCESSING_SKIPPED_STALE_DATE", status="PROCESSING")
+            logging.info(
+                "Skipping queued announcement outside current India date: %s %s announcement_datetime=%s expected=%s",
+                announcement.source,
+                announcement.company_name,
+                announcement.announcement_datetime,
+                _exchange_today().isoformat(),
+            )
+            mark_processed(announcement)
+            if debugger:
+                debugger.record_skip(announcement, "stale_queued_announcement_date")
+            return DONE
         if not announcement.pdf_path or not Path(announcement.pdf_path).exists():
             step_start = time.perf_counter()
             run_date = _job_run_date(announcement)
@@ -664,7 +679,26 @@ def _send_live_extraction_output(
 def _job_run_date(announcement: Announcement) -> date:
     """Return the download date for a queued announcement."""
 
-    return _parse_date_value(announcement.announcement_datetime) or datetime.now().date()
+    return _parse_date_value(announcement.announcement_datetime) or _exchange_today()
+
+
+def _exchange_today(instant: datetime | None = None) -> date:
+    """Return the current NSE/BSE calendar date in India."""
+
+    if instant is None:
+        return datetime.now(EXCHANGE_TIMEZONE).date()
+    if instant.tzinfo is None:
+        raise ValueError("instant must be timezone-aware")
+    return instant.astimezone(EXCHANGE_TIMEZONE).date()
+
+
+def _queued_job_is_current(announcement: Announcement, current_date: date | None = None) -> bool:
+    """Return whether a persisted live job still belongs to today's India date."""
+
+    if not _strict_live_announcement_date_enabled():
+        return True
+    announcement_date = _parse_date_value(announcement.announcement_datetime)
+    return announcement_date is None or announcement_date == (current_date or _exchange_today())
 
 
 def _send_startup_result_replay(sender: TelegramSender, summary: DailySummary) -> int:

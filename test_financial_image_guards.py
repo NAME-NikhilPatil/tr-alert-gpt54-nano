@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
@@ -11,6 +11,8 @@ from unittest.mock import patch
 
 import httpx
 from PIL import Image
+
+import main as main_module
 
 from bs_cf_image import _cash_flow_only_rows, build_bs_cf_rows, clean_variable_label
 from financial_cell_model import annotate_extraction_with_cell_model, canonical_cell_issues
@@ -128,6 +130,8 @@ def main() -> int:
         test_gradiente_verified_standalone_image_heavy_fallback,
         test_unclear_display_values_render_as_na,
         test_live_announcement_date_gate_skips_past_dates,
+        test_exchange_today_uses_india_timezone_at_utc_midnight_boundary,
+        test_queued_previous_day_job_is_stale_after_ist_midnight,
         test_manual_verification_warning_is_client_friendly,
         test_empty_financial_payload_is_silent_skip,
         test_display_cells_preserve_meaningful_small_values,
@@ -2355,6 +2359,29 @@ def test_live_announcement_date_gate_skips_past_dates() -> None:
     assert _filter_live_announcements([current, stale], run_date) == [current]
     assert _extraction_date_matches_live_run({"board_meeting_date": "1st June 2026"}, current, run_date)
     assert not _extraction_date_matches_live_run({"board_meeting_date": "27th May 2026"}, current, run_date)
+
+
+def test_exchange_today_uses_india_timezone_at_utc_midnight_boundary() -> None:
+    exchange_today = getattr(main_module, "_exchange_today", None)
+    assert callable(exchange_today), "main._exchange_today is required"
+    utc_instant = datetime(2026, 7, 14, 20, 40, tzinfo=timezone.utc)
+
+    assert exchange_today(utc_instant) == date(2026, 7, 15)
+
+
+def test_queued_previous_day_job_is_stale_after_ist_midnight() -> None:
+    queued_job_is_current = getattr(main_module, "_queued_job_is_current", None)
+    assert callable(queued_job_is_current), "main._queued_job_is_current is required"
+    previous_day = Announcement(
+        source="NSE",
+        company_name="Previous Day Limited",
+        identifier="PREVIOUS-DAY",
+        announcement_datetime="2026-07-14T20:20:20",
+        subject="Outcome of Board Meeting",
+        pdf_url="https://example.com/previous-day.pdf",
+    )
+
+    assert queued_job_is_current(previous_day, date(2026, 7, 15)) is False
 
 
 def test_manual_verification_warning_is_client_friendly() -> None:
