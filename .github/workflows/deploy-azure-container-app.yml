@@ -157,7 +157,7 @@ jobs:
               --output tsv)
 
             echo "Revision $revision state: $state"
-            if [[ "$state" == "Running" || "$state" == "Running at max" ]]; then
+            if [[ "$state" == "Running" || "$state" == "RunningAtMaxScale" ]]; then
               break
             fi
             if [[ "$state" == "Failed" || "$state" == "Degraded" ]]; then
