@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 from datetime import date
+import json
+import os
 from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
+import httpx
 from PIL import Image
 
 from bs_cf_image import _cash_flow_only_rows, build_bs_cf_rows, clean_variable_label
@@ -14,7 +19,10 @@ from financial_validation import validate_financial_payload
 from gpt54_extractor import (
     _apply_schema_defaults,
     _apply_verified_company_corrections,
+    _call_responses_api,
     _financial_model_route,
+    _extract_pdf_with_gpt54_llm_values_first,
+    _llm_values_result_period,
     _normalize_gpt_payload,
     _normalize_llm_values_first_payload,
     _safe_reasoning_effort,
@@ -122,7 +130,10 @@ def main() -> int:
         test_live_announcement_date_gate_skips_past_dates,
         test_manual_verification_warning_is_client_friendly,
         test_empty_financial_payload_is_silent_skip,
-        test_display_cells_hide_financial_decimals,
+        test_display_cells_preserve_meaningful_small_values,
+        test_llm_values_first_uses_first_quarter_date_as_result_period,
+        test_llm_values_first_retries_truncated_json_with_full_pdf,
+        test_responses_api_uses_dedicated_http_retries_for_503,
         test_reasoning_effort_is_clamped_to_high_or_xhigh,
         test_akme_warrant_pdf_is_structured_non_financial_skip,
     ]
@@ -260,7 +271,7 @@ def test_ahlada_verified_standalone_tax_eps_and_no_segment() -> None:
     rendered_rows = rows_to_table(rows, columns, skip_margin_changes=True)
     rendered_by_label = {row[0]: row for row in rendered_rows}
     q3_index = next(index + 1 for index, column in enumerate(columns) if column.get("period") == "Q3 FY26")
-    assert rendered_by_label["PAT"][q3_index] == "0"
+    assert rendered_by_label["PAT"][q3_index] == "0.2"
     assert by_label["EPS (Basic)"]["Q4 FY26"] == "(0.80)"
     bs_rows = build_bs_cf_rows(normalized)
     bs_labels = {row["label"] for row in bs_rows}
@@ -1461,7 +1472,7 @@ def test_llm_values_first_maps_nine_month_and_year_columns_by_position() -> None
     assert by_label["Revenue from operations"][index_by_label["FY25"]] == "131"
     assert by_label["Purchase of Trade Goods"][index_by_label["Q4 FY26"]] == "-"
     assert by_label["Exceptional Items"][index_by_label["Q4 FY26"]] == "-"
-    assert by_label["EPS Basic"][index_by_label["FY25"]] == "2"
+    assert by_label["EPS Basic"][index_by_label["FY25"]] == "2.87"
 
 
 def test_llm_values_first_generic_pnl_order_company_cleanup_and_bs_reconcile() -> None:
@@ -1519,7 +1530,7 @@ def test_llm_values_first_generic_pnl_order_company_cleanup_and_bs_reconcile() -
     pnl_table = rows_to_table(extraction["approved_pnl_rows"], extraction["approved_pnl_columns"], skip_margin_changes=True)
     by_label = {row[0]: row for row in pnl_table}
     assert by_label["Total Income"][1] == "129"
-    assert by_label["Profit before tax and exceptional items as per PDF"][1] == "1"
+    assert by_label["Profit before tax and exceptional items as per PDF"][1] == "1.24"
 
     bs_table = rows_to_table(extraction["approved_bs_cf_rows"], extraction["approved_bs_cf_columns"], skip_margin_changes=True)
     bs_by_label = {row[0]: row for row in bs_table}
@@ -1564,7 +1575,7 @@ def test_llm_values_first_recomputes_gross_profit_ebitda_and_margin() -> None:
 
     assert by_label["Gross Profit"][1] == "93"
     assert by_label["EBITDA"][1] == "87"
-    assert by_label["EBITDA Margin"][1] == "0%"
+    assert by_label["EBITDA Margin"][1] == "0.95%"
 
 
 def test_llm_values_first_revenue_order_total_income_note_and_liabilities_row() -> None:
@@ -1623,9 +1634,9 @@ def test_llm_values_first_revenue_order_total_income_note_and_liabilities_row() 
 
     pnl_table = rows_to_table(extraction["approved_pnl_rows"], extraction["approved_pnl_columns"], skip_margin_changes=True)
     pnl_by_label = {row[0]: row for row in pnl_table}
-    assert pnl_by_label["Other income/write-back"][1] == "2"
-    assert pnl_by_label["Cost of Goods Consumed"][2] == "4"
-    assert pnl_by_label["Changes in inventories"][3] == "(1)"
+    assert pnl_by_label["Other income/write-back"][1] == "2.11"
+    assert pnl_by_label["Cost of Goods Consumed"][2] == "4.15"
+    assert pnl_by_label["Changes in inventories"][3] == "(1.64)"
 
     bs_table = rows_to_table(extraction["approved_bs_cf_rows"], extraction["approved_bs_cf_columns"], skip_margin_changes=True)
     bs_by_label = {row[0]: row for row in bs_table}
@@ -2391,13 +2402,115 @@ def test_empty_financial_payload_is_silent_skip() -> None:
     assert blocked.missing_sections == []
 
 
-def test_display_cells_hide_financial_decimals() -> None:
+def test_display_cells_preserve_meaningful_small_values() -> None:
     assert format_display_cell("Revenue from Operations", "875.43") == "875"
     assert format_display_cell("Changes in inventories", "-23.75") == "(23)"
+    assert format_display_cell("Revenue from Operations", "0.888") == "0.89"
+    assert format_display_cell("Finance costs", "-0.0038") == "(0.0038)"
     assert format_display_cell("Exceptional Items", "-") == "-"
     assert format_display_cell("Purchase of Trade Goods", "") == ""
-    assert format_display_cell("EPS (Basic)", "3.97") == "3"
+    assert format_display_cell("EPS (Basic)", "0.07") == "0.07"
+    assert format_display_cell("EPS (Basic)", "-0.02") == "(0.02)"
     assert format_display_cell("EBITDA Margin %", "12.345%") == "12%"
+
+
+def test_llm_values_first_uses_first_quarter_date_as_result_period() -> None:
+    periods = ["30.06.2026", "31.03.2026", "30.06.2025", "31.03.2026"]
+    columns = [
+        {"label": "30.06.2026", "period": "30.06.2026"},
+        {"label": "FY26", "period": "31.03.2026"},
+        {"label": "30.06.2025", "period": "30.06.2025"},
+    ]
+
+    assert _llm_values_result_period(periods, columns) == "Q1 FY27"
+
+
+def test_llm_values_first_retries_truncated_json_with_full_pdf() -> None:
+    complete_payload = {
+        "company_name": "Recovery Limited",
+        "selected_basis": "STANDALONE",
+        "basis_note": "ONLY STANDALONE FOUND",
+        "source_unit": "Rs in Cr",
+        "display_unit": "Rs in Cr",
+        "currency": "INR",
+        "periods": ["Q1 FY27"],
+        "pnl_image": {
+            "title": "Quarterly Results",
+            "columns": ["Q1 FY27"],
+            "rows": [
+                {
+                    "label": "Revenue",
+                    "values": {"Q1 FY27": 12.5},
+                    "is_bold": True,
+                    "section": "Income",
+                    "source_note": "Visible in PDF.",
+                    "confidence": "high",
+                }
+            ],
+            "warnings": [],
+        },
+        "bs_cf_image": {
+            "title": "",
+            "columns": [],
+            "balance_sheet_rows": [],
+            "cash_flow_rows": [],
+            "warnings": [],
+        },
+        "segment_image": {"required": False, "title": "", "columns": [], "rows": [], "warnings": []},
+        "global_warnings": [],
+        "render_decision": {"should_render": True, "reason": ""},
+    }
+    truncated_response = {
+        "status": "incomplete",
+        "incomplete_details": {"reason": "max_output_tokens"},
+        "output_text": '{"company_name":"Recovery Limited","pnl_image":{"rows":[{"label":"Revenue',
+    }
+    repaired_response = {
+        "status": "completed",
+        "output_text": json.dumps(complete_payload),
+        "usage": {"input_tokens": 100, "output_tokens": 200, "total_tokens": 300},
+        "output": [],
+    }
+
+    with TemporaryDirectory() as temp_dir:
+        pdf_path = Path(temp_dir) / "recovery.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n% regression fixture\n")
+        artifact_dir = Path(temp_dir) / "artifacts"
+        with (
+            patch("gpt54_extractor._call_responses_api", side_effect=[truncated_response, repaired_response]) as call,
+            patch("gpt54_extractor._gpt54_artifact_dir", return_value=artifact_dir),
+        ):
+            extraction = _extract_pdf_with_gpt54_llm_values_first(pdf_path, None, {})
+
+    assert call.call_count == 2
+    assert extraction["gpt_json_status"] == "valid"
+    assert extraction["company_name"] == "Recovery Limited"
+    assert extraction["gpt54_execution_metadata"]["repair_attempted"] is True
+    assert extraction["gpt54_execution_metadata"]["repair_used"] is True
+
+
+def test_responses_api_uses_dedicated_http_retries_for_503() -> None:
+    request = httpx.Request("POST", "https://example.openai.azure.com/openai/responses")
+    responses = [
+        httpx.Response(503, request=request, text="upstream connection termination"),
+        httpx.Response(503, request=request, text="upstream connection termination"),
+        httpx.Response(200, request=request, json={"id": "response-ok", "output": []}),
+    ]
+    env = {
+        "GPT54_RESPONSES_URL": str(request.url),
+        "GPT54_API_KEY": "test-key",
+        "GPT54_RETRIES": "1",
+        "GPT54_HTTP_RETRIES": "3",
+        "GPT54_USE_RESPONSE_FORMAT": "false",
+    }
+    with patch.dict(os.environ, env, clear=False):
+        with patch("gpt54_extractor.httpx.post", side_effect=responses) as post_mock:
+            with patch("gpt54_extractor.time.sleep") as sleep_mock:
+                result = _call_responses_api("Return JSON.", "ping")
+
+    assert result["id"] == "response-ok"
+    assert post_mock.call_count == 3
+    assert sleep_mock.call_count == 2
 
 
 def test_reasoning_effort_is_clamped_to_high_or_xhigh() -> None:

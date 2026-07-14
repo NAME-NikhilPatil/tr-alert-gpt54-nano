@@ -44,8 +44,7 @@ async def fetch_nse_announcements(run_date: date) -> list[Announcement]:
 
     try:
         announcements = await _fetch_nse_via_api(run_date)
-        if announcements:
-            return announcements
+        return announcements
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code if exc.response is not None else 0
         if status == 403:
@@ -66,7 +65,13 @@ async def _fetch_nse_via_api(run_date: date) -> list[Announcement]:
 
     headers = _nse_request_headers(accept_json=True)
     async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=45) as client:
-        await request_with_retries(client, "GET", NSE_BASE_URL, headers=headers)
+        try:
+            await request_with_retries(client, "GET", NSE_BASE_URL, headers=headers)
+        except httpx.HTTPError as exc:
+            logging.warning(
+                "NSE homepage warm-up failed (%s); trying the public announcements API directly.",
+                exc,
+            )
         for params in _nse_api_param_sets(run_date):
             response = await request_with_retries(client, "GET", NSE_API_URL, params=params, headers=headers)
             try:

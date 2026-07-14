@@ -1632,7 +1632,7 @@ def format_number(value: float) -> str:
 
 
 def format_display_cell(label: str, value: Any) -> str:
-    """Format visible table values without decimal points."""
+    """Format visible values while preserving meaningful small amounts."""
 
     text = _compact_numeric_spacing("" if value is None else str(value).strip())
     if _is_unclear_value(text):
@@ -1651,7 +1651,7 @@ def format_display_cell(label: str, value: Any) -> str:
     number = float(numeric_text)
     if negative_parentheses:
         number = -abs(number)
-    return _format_whole_display_number(number)
+    return _format_adaptive_display_number(number)
 
 
 def truncate_decimal_display(value: Any) -> str:
@@ -1690,7 +1690,7 @@ def _format_numeric_display(text: str, *, force_two_decimals: bool, percent: boo
     number = float(numeric_text)
     if negative_parentheses:
         number = -abs(number)
-    return _format_whole_display_number(number) + suffix
+    return _format_adaptive_display_number(number) + suffix
 
 
 def _format_parenthesized_number(value: float, *, decimals: int) -> str:
@@ -1708,6 +1708,19 @@ def _format_whole_display_number(value: float) -> str:
         return ""
     number = math.trunc(abs(value))
     text = str(number)
+    return f"({text})" if value < 0 else text
+
+
+def _format_adaptive_display_number(value: float) -> str:
+    """Keep the integer style for large values without displaying small values as zero."""
+
+    if not math.isfinite(value):
+        return ""
+    absolute = abs(value)
+    if absolute == 0 or absolute >= 10:
+        return _format_whole_display_number(value)
+    decimals = 4 if absolute < 0.01 else 2
+    text = f"{absolute:.{decimals}f}".rstrip("0").rstrip(".")
     return f"({text})" if value < 0 else text
 
 

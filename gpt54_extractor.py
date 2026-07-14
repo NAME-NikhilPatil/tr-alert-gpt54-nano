@@ -1000,6 +1000,10 @@ def _extract_pdf_with_gpt54_llm_values_first(
     """Return render-ready values from GPT-5.4 high with warning-only validation."""
 
     last_text = ""
+    initial_text = ""
+    repair_attempted = False
+    repair_used = False
+    recovery_reason = ""
     artifact_dir = _gpt54_artifact_dir(path, announcement) / "llm_values_first"
     artifact_dir.mkdir(parents=True, exist_ok=True)
     try:
@@ -1010,19 +1014,49 @@ def _extract_pdf_with_gpt54_llm_values_first(
             schema_name="llm_values_first_render_payload",
         )
         last_text = _response_text(response)
-        payload = _decode_json(last_text)
+        initial_text = last_text
+        try:
+            payload = _decode_json(last_text)
+        except ValueError as exc:
+            repair_attempted = True
+            incomplete_details = response.get("incomplete_details") if isinstance(response, dict) else {}
+            if not isinstance(incomplete_details, dict):
+                incomplete_details = {}
+            recovery_reason = str(incomplete_details.get("reason") or type(exc).__name__)
+            if initial_text:
+                (artifact_dir / "llm_values_first_truncated_response.txt").write_text(
+                    initial_text,
+                    encoding="utf-8",
+                    errors="ignore",
+                )
+            response = _call_responses_api(
+                (
+                    "The previous extraction response ended before a complete JSON object was returned. "
+                    "Re-read the attached PDF from the beginning and regenerate one complete JSON object "
+                    "matching the required schema. Do not continue the old fragment. Keep source_note and "
+                    "warning text concise so every table and closing JSON field fits. Return JSON only."
+                ),
+                _pdf_user_input(path, announcement),
+                response_schema=llm_values_first_json_schema(),
+                schema_name="llm_values_first_render_payload_recovery",
+            )
+            last_text = _response_text(response)
+            payload = _decode_json(last_text)
+            repair_used = True
         normalized = _normalize_llm_values_first_payload(payload, path, announcement, ocr_payload)
         normalized["gpt54_execution_metadata"] = _response_execution_metadata(
             response,
             response_text=last_text,
             schema_valid=True,
-            repair_attempted=False,
-            repair_used=False,
+            repair_attempted=repair_attempted,
+            repair_used=repair_used,
         ) | {
             "direct_pdf_input": True,
             "llm_values_first_mode": True,
             "artifact_dir": str(artifact_dir),
             "reasoning_effort": _configured_reasoning_effort(),
+            "initial_response_text_chars": len(initial_text),
+            "json_recovery_reason": recovery_reason,
         }
         _write_json(artifact_dir / "llm_values_first_payload.json", payload)
         _write_json(artifact_dir / "normalized_llm_values_first.json", normalized)
@@ -1729,6 +1763,10 @@ def _llm_values_result_period(periods: list[str], columns: list[dict[str, str]])
         text = str(candidate or "").strip()
         if re.search(r"\bQ[1-4]\s*FY\s*\d{2,4}\b", text, flags=re.IGNORECASE):
             return re.sub(r"\s+", " ", text.upper().replace("FY ", "FY")).strip()
+    if candidates:
+        date_period = _period_from_date_label(str(candidates[0] or ""), period_context="pnl")
+        if date_period and (_parse_period_label(date_period) or ("", 0))[0].startswith("Q"):
+            return date_period
     for candidate in candidates:
         text = str(candidate or "").strip()
         if re.search(r"\b9M\s*FY\s*\d{2,4}\b", text, flags=re.IGNORECASE):
@@ -3473,7 +3511,7 @@ def _call_responses_api(
     response_schema: dict[str, Any] | None = None,
     schema_name: str = "financial_result_extraction",
 ) -> dict[str, Any]:
-    """Call the Responses API with one retry and credential-safe errors."""
+    """Call the Responses API with bounded transport retries and credential-safe errors."""
 
     url = _configured_responses_url()
     api_key = _configured_api_key()
@@ -3516,7 +3554,7 @@ def _call_responses_api(
         }
 
     timeout = float(os.environ.get("GPT54_TIMEOUT_SECONDS", "900"))
-    retries = max(1, min(3, int(os.environ.get("GPT54_RETRIES", "2"))))
+    retries = max(1, min(5, int(os.environ.get("GPT54_HTTP_RETRIES", "3"))))
     last_error = ""
     xhigh_retry_used = False
     for attempt in range(retries):

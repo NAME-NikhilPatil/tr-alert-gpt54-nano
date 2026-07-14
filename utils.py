@@ -279,7 +279,10 @@ async def download_pdf(
     async with httpx.AsyncClient(headers=headers, follow_redirects=True, timeout=45) as client:
         try:
             if source == "NSE":
-                await request_with_retries(client, "GET", NSE_BASE_URL, headers=headers)
+                try:
+                    await request_with_retries(client, "GET", NSE_BASE_URL, headers=headers)
+                except httpx.HTTPError as exc:
+                    logging.warning("NSE homepage warm-up failed; downloading archive PDF directly: %s", exc)
             elif source == "BSE":
                 await request_with_retries(client, "GET", BSE_BASE_URL, headers=headers)
             try:
@@ -287,7 +290,10 @@ async def download_pdf(
             except Exception:
                 # Some exchange attachment URLs are backed by short-lived sessions; refresh cookies and retry once.
                 if source == "NSE":
-                    await request_with_retries(client, "GET", NSE_BASE_URL, headers=headers)
+                    try:
+                        await request_with_retries(client, "GET", NSE_BASE_URL, headers=headers)
+                    except httpx.HTTPError as exc:
+                        logging.warning("NSE homepage refresh failed; retrying archive PDF directly: %s", exc)
                 elif source == "BSE":
                     await request_with_retries(client, "GET", BSE_BASE_URL, headers=headers)
                 response = await request_with_retries(client, "GET", pdf_url, headers=headers)
