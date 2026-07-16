@@ -120,23 +120,116 @@ jobs:
             --username "${{ secrets.AZURE_REGISTRY_USERNAME }}" \
             --password "${{ secrets.AZURE_REGISTRY_PASSWORD }}"
 
-      - name: Verify persistent runtime storage mount
+      - name: Ensure persistent runtime storage mount
         shell: bash
         run: |
+          set -euo pipefail
+          resource_group="${{ secrets.AZURE_RESOURCE_GROUP }}"
+          app_name="${{ secrets.AZURE_CONTAINER_APP_NAME }}"
           mount_volume=$(az containerapp show \
-            --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
-            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --name "$app_name" \
+            --resource-group "$resource_group" \
             --query "properties.template.containers[0].volumeMounts[?mountPath=='/data'].volumeName | [0]" \
             --output tsv)
 
           if [[ -z "$mount_volume" ]]; then
-            echo "::error::Container App must mount persistent Azure Files storage at /data before deployment."
-            exit 1
+            echo "No /data mount exists; provisioning an Azure Files runtime volume."
+            environment_id=$(az containerapp show \
+              --name "$app_name" \
+              --resource-group "$resource_group" \
+              --query properties.managedEnvironmentId \
+              --output tsv)
+            environment_name="${environment_id##*/}"
+            location=$(az group show --name "$resource_group" --query location --output tsv)
+            subscription_id=$(az account show --query id --output tsv)
+            storage_hash=$(printf '%s' "${subscription_id}|${resource_group}|${app_name}" | sha256sum | cut -c1-12)
+            storage_account="tralert${storage_hash}"
+            storage_share="tr-alert-data"
+            environment_storage="tralertruntime"
+            volume_name="runtime-data"
+
+            if ! az storage account show --name "$storage_account" --resource-group "$resource_group" >/dev/null 2>&1; then
+              az storage account create \
+                --name "$storage_account" \
+                --resource-group "$resource_group" \
+                --location "$location" \
+                --sku Standard_LRS \
+                --kind StorageV2 \
+                --https-only true \
+                --min-tls-version TLS1_2 \
+                --allow-blob-public-access false \
+                --output none
+            fi
+
+            storage_key=$(az storage account keys list \
+              --account-name "$storage_account" \
+              --resource-group "$resource_group" \
+              --query '[0].value' \
+              --output tsv)
+            az storage share create \
+              --name "$storage_share" \
+              --account-name "$storage_account" \
+              --account-key "$storage_key" \
+              --quota 20 \
+              --output none
+            az containerapp env storage set \
+              --name "$environment_name" \
+              --resource-group "$resource_group" \
+              --storage-name "$environment_storage" \
+              --storage-type AzureFile \
+              --azure-file-account-name "$storage_account" \
+              --azure-file-account-key "$storage_key" \
+              --azure-file-share-name "$storage_share" \
+              --access-mode ReadWrite \
+              --output none
+            unset storage_key
+
+            az containerapp show \
+              --name "$app_name" \
+              --resource-group "$resource_group" \
+              --output yaml > app-with-storage.yaml
+            python3 -m pip install --disable-pip-version-check --quiet "PyYAML>=6.0,<7"
+            python3 - <<'PY'
+          from pathlib import Path
+          import os
+          import yaml
+
+          path = Path("app-with-storage.yaml")
+          document = yaml.safe_load(path.read_text(encoding="utf-8"))
+          properties = document.setdefault("properties", {})
+          configuration = properties.get("configuration")
+          if isinstance(configuration, dict):
+              configuration.pop("secrets", None)
+          template = properties.setdefault("template", {})
+          template["revisionSuffix"] = f"storage-{os.environ['GITHUB_RUN_NUMBER']}-{os.environ['GITHUB_SHA'][:7]}"
+          volumes = [
+              item for item in (template.get("volumes") or [])
+              if item.get("name") != "runtime-data" and item.get("storageName") != "tralertruntime"
+          ]
+          volumes.append({"name": "runtime-data", "storageType": "AzureFile", "storageName": "tralertruntime"})
+          template["volumes"] = volumes
+          containers = template.get("containers") or []
+          if not containers:
+              raise SystemExit("Container App template has no containers")
+          mounts = [
+              item for item in (containers[0].get("volumeMounts") or [])
+              if item.get("mountPath") != "/data" and item.get("volumeName") != "runtime-data"
+          ]
+          mounts.append({"volumeName": "runtime-data", "mountPath": "/data"})
+          containers[0]["volumeMounts"] = mounts
+          path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+          PY
+            az containerapp update \
+              --name "$app_name" \
+              --resource-group "$resource_group" \
+              --yaml app-with-storage.yaml \
+              --output none
+            mount_volume="$volume_name"
           fi
 
           storage_name=$(az containerapp show \
-            --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
-            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --name "$app_name" \
+            --resource-group "$resource_group" \
             --query "properties.template.volumes[?name=='${mount_volume}' && storageType=='AzureFile'].storageName | [0]" \
             --output tsv)
 
