@@ -241,6 +241,89 @@ jobs:
 
           echo "Persistent runtime storage verified: volume=$mount_volume storage=$storage_name mount=/data"
 
+      - name: Stop prior worker and release persistent file handles
+        shell: bash
+        run: |
+          set -euo pipefail
+          resource_group="${{ secrets.AZURE_RESOURCE_GROUP }}"
+          app_name="${{ secrets.AZURE_CONTAINER_APP_NAME }}"
+
+          # SQLite cannot safely hand a database on an SMB share from one
+          # Container Apps host to another while both revisions overlap.
+          az containerapp revision set-mode \
+            --name "$app_name" \
+            --resource-group "$resource_group" \
+            --mode single \
+            --output none
+
+          mapfile -t active_revisions < <(az containerapp revision list \
+            --name "$app_name" \
+            --resource-group "$resource_group" \
+            --query '[?properties.active].name' \
+            --output tsv)
+
+          for old_revision in "${active_revisions[@]}"; do
+            [[ -z "$old_revision" ]] && continue
+            echo "Stopping prior worker revision: $old_revision"
+            az containerapp revision deactivate \
+              --revision "$old_revision" \
+              --resource-group "$resource_group" \
+              --output none
+          done
+
+          for attempt in {1..30}; do
+            remaining_replicas=0
+            for old_revision in "${active_revisions[@]}"; do
+              [[ -z "$old_revision" ]] && continue
+              replicas=$(az containerapp revision show \
+                --name "$app_name" \
+                --resource-group "$resource_group" \
+                --revision "$old_revision" \
+                --query properties.replicas \
+                --output tsv 2>/dev/null || true)
+              remaining_replicas=$((remaining_replicas + ${replicas:-0}))
+            done
+            echo "Waiting for prior worker shutdown: remaining_replicas=$remaining_replicas"
+            if [[ "$remaining_replicas" == "0" ]]; then
+              break
+            fi
+            if [[ "$attempt" == "30" ]]; then
+              echo "::error::Prior worker replicas did not stop before the SQLite handoff."
+              exit 1
+            fi
+            sleep 5
+          done
+
+          subscription_id=$(az account show --query id --output tsv)
+          storage_hash=$(printf '%s' "${subscription_id}|${resource_group}|${app_name}" | sha256sum | cut -c1-12)
+          storage_account="tralert${storage_hash}"
+          storage_share="tr-alert-data"
+          storage_key=$(az storage account keys list \
+            --account-name "$storage_account" \
+            --resource-group "$resource_group" \
+            --query '[0].value' \
+            --output tsv)
+
+          echo "Closing stale Azure Files handles after all worker replicas stopped."
+          if ! az storage share close-handle \
+            --account-name "$storage_account" \
+            --account-key "$storage_key" \
+            --name "$storage_share" \
+            --close-all true \
+            --recursive true \
+            --output none; then
+            az extension add --name storage-preview --upgrade --only-show-errors
+            az storage share close-handle \
+              --account-name "$storage_account" \
+              --account-key "$storage_key" \
+              --name "$storage_share" \
+              --close-all true \
+              --recursive true \
+              --output none
+          fi
+          unset storage_key
+          sleep 5
+
       - name: Deploy a new Azure Container Apps revision
         id: deploy
         shell: bash
@@ -382,5 +465,32 @@ jobs:
             exit 1
           fi
           echo "Deployment verified: worker replica remained ready with zero restarts for 60 seconds."
+
+          echo "Checking console logs for completed application startup."
+          startup_verified=0
+          startup_logs=""
+          for attempt in {1..12}; do
+            startup_logs=$(timeout 20s az containerapp logs show \
+              --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --revision "$revision" \
+              --type console \
+              --tail 200 \
+              --format text 2>&1 || true)
+            if grep -Fq "Starting live Telegram scraper" <<<"$startup_logs" && \
+               grep -Fq "PDF worker pool started" <<<"$startup_logs"; then
+              startup_verified=1
+              break
+            fi
+            echo "Application startup marker not visible yet (attempt $attempt/12)."
+            sleep 5
+          done
+
+          if [[ "$startup_verified" != "1" ]]; then
+            echo "::error::The container process is running, but the scraper did not complete application startup."
+            printf '%s\n' "$startup_logs"
+            exit 1
+          fi
+          echo "Application startup verified from worker logs."
 
           echo "Azure revision $revision is running image $deployed_image"
