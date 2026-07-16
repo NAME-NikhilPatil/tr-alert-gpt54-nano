@@ -176,7 +176,6 @@ jobs:
               --name "$environment_name" \
               --resource-group "$resource_group" \
               --storage-name "$environment_storage" \
-              --storage-type AzureFile \
               --azure-file-account-name "$storage_account" \
               --azure-file-account-key "$storage_key" \
               --azure-file-share-name "$storage_share" \
