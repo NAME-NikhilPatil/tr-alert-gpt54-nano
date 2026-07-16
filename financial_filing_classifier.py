@@ -75,7 +75,7 @@ def classify_pdf_filing(pdf_path: str | Path, announcement: Any | None = None) -
     """Classify a PDF without calling an LLM or using company-specific rules."""
 
     path = Path(pdf_path)
-    text, page_count, pages_scanned, _image_heavy_pages = extract_pdf_text(path, max_pages=8)
+    text, page_count, pages_scanned, image_heavy_pages = extract_pdf_text(path, max_pages=0)
     compact = _normalize_text(text)
     company = _company_name(path, announcement, text)
 
@@ -125,6 +125,21 @@ def classify_pdf_filing(pdf_path: str | Path, announcement: Any | None = None) -
             reason="No financial result tables found. PDF contains a director or governance disclosure.",
             financial_images_required=False,
             confidence="medium",
+            text_pages_scanned=pages_scanned,
+            page_count=page_count,
+            text_char_count=len(text),
+        )
+
+    if image_heavy_pages:
+        return FilingClassification(
+            filing_type=FINANCIAL_RESULTS,
+            company_name=company,
+            reason=(
+                "The PDF is scanned or image-only, so local text cannot safely rule out financial results; "
+                "send it to GPT vision for final classification and extraction."
+            ),
+            financial_images_required=True,
+            confidence="low",
             text_pages_scanned=pages_scanned,
             page_count=page_count,
             text_char_count=len(text),

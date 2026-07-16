@@ -27,13 +27,17 @@ from pdf_job_queue import queue_counts
 from pdf_job_queue import requeue_job
 
 
+class RetryablePdfJobError(RuntimeError):
+    """A transient job failure that may safely be attempted once more."""
+
+
 @dataclass(slots=True)
 class PdfJobWorkerConfig:
     """Worker-pool runtime configuration."""
 
-    max_concurrent_pdf_jobs: int = 3
+    max_concurrent_pdf_jobs: int = 1
     pdfs_per_gpt_request: int = 1
-    retry_limit: int = 2
+    retry_limit: int = 1
     idle_sleep_seconds: float = 1.0
     heartbeat_interval_seconds: float = 60.0
 
@@ -181,7 +185,8 @@ class PdfJobWorkerPool:
             except Exception as exc:
                 elapsed = time.perf_counter() - started
                 error = str(exc)
-                if job.attempt_count <= self.config.retry_limit:
+                retryable = isinstance(exc, RetryablePdfJobError)
+                if retryable and job.attempt_count <= self.config.retry_limit:
                     requeue_job(job.id, error, db_path=self.db_path)
                     runtime.log_event(
                         "PDF_PROCESSING_FAILED",

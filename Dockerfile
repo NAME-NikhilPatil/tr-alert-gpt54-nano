@@ -25,8 +25,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 RUN python -m playwright install --with-deps chromium
 
-COPY . .
+RUN groupadd --system appuser && useradd --system --gid appuser --home-dir /app appuser
 
-RUN mkdir -p downloads images logs output
+COPY --chown=appuser:appuser . .
+
+RUN mkdir -p downloads images logs output && chown -R appuser:appuser /app
+
+USER appuser
 
 CMD ["python", "main.py"]

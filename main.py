@@ -53,6 +53,7 @@ from pdf_job_queue import update_job_local_path
 from pdf_job_worker import PdfJobRuntime
 from pdf_job_worker import PdfJobWorkerConfig
 from pdf_job_worker import PdfJobWorkerPool
+from pdf_job_worker import RetryablePdfJobError
 from pdf_parser import parse_pdf
 from telegram_sender import TelegramSender
 from utils import (
@@ -237,6 +238,7 @@ def run_live_polling_loop() -> None:
     """Poll NSE/BSE every configured interval and send new PDFs to Telegram."""
 
     _load_environment()
+    _configure_runtime_data_dir()
     _apply_live_pipeline_env_defaults()
     log_path = setup_live_logging()
     ensure_directories()
@@ -250,9 +252,9 @@ def run_live_polling_loop() -> None:
         logging.info("Requeued %s PDF job(s) left PROCESSING by a previous shutdown.", reset_count)
 
     poll_interval = int(os.environ.get("SCRAPER_POLL_INTERVAL_SECONDS") or os.environ.get("POLL_INTERVAL_SECONDS", "60"))
-    max_workers = int(os.environ.get("MAX_CONCURRENT_PDF_JOBS", "3"))
+    max_workers = int(os.environ.get("MAX_CONCURRENT_PDF_JOBS", "1"))
     pdfs_per_request = int(os.environ.get("PDFS_PER_GPT_REQUEST", "1"))
-    retry_limit = int(os.environ.get("PDF_JOB_RETRY_LIMIT", "2"))
+    retry_limit = int(os.environ.get("PDF_JOB_RETRY_LIMIT", "1"))
     telegram_enabled = _truthy_env("TELEGRAM_ENABLED", True) and not _truthy_env("DRY_RUN", False)
     bot_token = os.environ.get("TELEGRAM_BOT_TOKEN", "")
     seed_chat_ids = os.environ.get("TELEGRAM_CHAT_IDS", "") or os.environ.get("TELEGRAM_CHAT_ID", "")
@@ -343,19 +345,40 @@ def _load_environment() -> None:
     load_dotenv(dotenv_path=env_path, override=True, encoding="utf-8-sig")
 
 
+def _configure_runtime_data_dir() -> Path:
+    """Move all relative runtime state under the configured persistent data root."""
+
+    configured = os.environ.get("TR_ALERT_DATA_DIR", "").strip()
+    if not configured:
+        return Path.cwd()
+    data_dir = Path(configured).expanduser().resolve()
+    data_dir.mkdir(parents=True, exist_ok=True)
+    os.chdir(data_dir)
+    return data_dir
+
+
 def _apply_live_pipeline_env_defaults() -> None:
     """Apply queue/GPT defaults without changing existing extraction mode."""
 
-    os.environ.setdefault("MAX_CONCURRENT_PDF_JOBS", "3")
+    os.environ.setdefault("MAX_CONCURRENT_PDF_JOBS", "1")
     os.environ.setdefault("PDFS_PER_GPT_REQUEST", "1")
     os.environ.setdefault("GPT_MODEL", os.environ.get("GPT54_MODEL", "gpt-5.4-nano"))
     os.environ.setdefault("GPT54_MODEL", os.environ.get("GPT_MODEL", "gpt-5.4-nano"))
     os.environ.setdefault("PRIMARY_MODEL", os.environ.get("GPT54_MODEL", "gpt-5.4-nano"))
-    os.environ.setdefault("GPT_REQUEST_TIMEOUT_SECONDS", os.environ.get("GPT54_TIMEOUT_SECONDS", "900"))
-    os.environ.setdefault("GPT54_TIMEOUT_SECONDS", os.environ.get("GPT_REQUEST_TIMEOUT_SECONDS", "900"))
+    os.environ.setdefault("GPT_REQUEST_TIMEOUT_SECONDS", os.environ.get("GPT54_TIMEOUT_SECONDS", "1800"))
+    os.environ.setdefault("GPT54_TIMEOUT_SECONDS", os.environ.get("GPT_REQUEST_TIMEOUT_SECONDS", "1800"))
+    os.environ.setdefault("GPT54_COMPLEX_TIMEOUT_SECONDS", "2700")
+    os.environ.setdefault("GPT54_HTTP_RETRIES", "1")
+    os.environ.setdefault("GPT54_BACKGROUND_MODE", "true")
+    os.environ.setdefault("GPT54_BACKGROUND_POLL_SECONDS", "5")
+    os.environ.setdefault("GPT54_MAX_OUTPUT_TOKENS", "48000")
+    os.environ.setdefault("GPT54_DEFAULT_REASONING_EFFORT", "high")
+    os.environ.setdefault("GPT54_COMPLEX_REASONING_EFFORT", "high")
+    os.environ.setdefault("GPT54_USE_XHIGH_FOR_COMPLEX", "false")
+    os.environ.setdefault("GPT54_RETRY_XHIGH_ON_VALUES_FIRST_WARNINGS", "false")
     os.environ.setdefault("SCRAPER_POLL_INTERVAL_SECONDS", os.environ.get("POLL_INTERVAL_SECONDS", "60"))
     os.environ.setdefault("POLL_INTERVAL_SECONDS", os.environ.get("SCRAPER_POLL_INTERVAL_SECONDS", "60"))
-    os.environ.setdefault("PDF_JOB_RETRY_LIMIT", os.environ.get("GPT54_RETRIES", "2"))
+    os.environ.setdefault("PDF_JOB_RETRY_LIMIT", "1")
     os.environ.setdefault("DRY_RUN", "false")
     os.environ.setdefault("TELEGRAM_ENABLED", os.environ.get("LIVE_TELEGRAM_SEND", "true"))
     if os.environ.get("PDFS_PER_GPT_REQUEST") != "1":
@@ -468,8 +491,7 @@ async def _poll_once(
 
     today = _exchange_today()
     announcements: list[Announcement] = []
-    nse_items = await fetch_nse_announcements(today)
-    bse_items = await fetch_bse_announcements(today)
+    nse_items, bse_items = await _fetch_exchange_announcements(today)
     raw_counts = {"NSE": len(nse_items), "BSE": len(bse_items)}
     announcements.extend(nse_items)
     announcements.extend(bse_items)
@@ -536,6 +558,24 @@ async def _poll_once(
     return discovered_count, queued_count
 
 
+async def _fetch_exchange_announcements(run_date: date) -> tuple[list[Announcement], list[Announcement]]:
+    """Fetch both exchanges concurrently while isolating a failure on either side."""
+
+    results = await asyncio.gather(
+        fetch_nse_announcements(run_date),
+        fetch_bse_announcements(run_date),
+        return_exceptions=True,
+    )
+    items: list[list[Announcement]] = []
+    for source, result in zip(("NSE", "BSE"), results):
+        if isinstance(result, BaseException):
+            logging.error("%s announcement discovery failed; the other exchange will continue: %s", source, result)
+            items.append([])
+        else:
+            items.append(result)
+    return items[0], items[1]
+
+
 def _process_live_pdf_job(
     job: Any,
     runtime: PdfJobRuntime,
@@ -547,6 +587,7 @@ def _process_live_pdf_job(
     item_start = time.perf_counter()
     announcement = job_to_announcement(job)
     timings: dict[str, float] = {}
+    extraction: dict[str, Any] = {}
     try:
         if not _queued_job_is_current(announcement):
             runtime.log_event("PDF_PROCESSING_SKIPPED_STALE_DATE", status="PROCESSING")
@@ -578,6 +619,16 @@ def _process_live_pdf_job(
         extraction = extract_pdf_with_gpt54(announcement.pdf_path, announcement)
         timings["gpt54_pdf"] = round(time.perf_counter() - step_start, 3)
         runtime.log_event("GPT_REQUEST_FINISHED", status="PROCESSING", elapsed_seconds=timings["gpt54_pdf"], pdfs_per_gpt_request=1)
+        extraction_failure = _gpt_extraction_failure_reason(extraction)
+        if extraction_failure:
+            runtime.log_event(
+                "GPT_REQUEST_FAILED",
+                status="PROCESSING",
+                elapsed_seconds=timings["gpt54_pdf"],
+                error=extraction_failure[:500],
+            )
+            error_type = RetryablePdfJobError if _is_retryable_gpt_transport_failure(extraction_failure) else RuntimeError
+            raise error_type(f"GPT extraction failed: {extraction_failure[:500]}")
         extracted_at = datetime.now()
 
         if not _extraction_date_matches_live_run(extraction, announcement, _job_run_date(announcement)):
@@ -632,6 +683,35 @@ def _process_live_pdf_job(
         timings["total"] = round(time.perf_counter() - item_start, 3)
         if debugger:
             debugger.record_error(announcement=announcement, error=exc, timings=timings)
+        retry_limit = max(0, int(os.environ.get("PDF_JOB_RETRY_LIMIT", "1")))
+        retry_scheduled = (
+            isinstance(exc, RetryablePdfJobError)
+            and int(getattr(job, "attempt_count", 1) or 1) <= retry_limit
+        )
+        logging.exception(
+            "PDF processing failed for %s %s; detailed error stays in logs retry_scheduled=%s generic_notice_deferred=%s.",
+            announcement.source,
+            announcement.company_name,
+            retry_scheduled,
+            retry_scheduled,
+        )
+        notice_sent = False
+        if sender is not None and not retry_scheduled:
+            try:
+                notice_sent = bool(sender.send_text(_no_financial_data_message(extraction, announcement)))
+            except Exception:
+                logging.exception(
+                    "Failed to send generic no-data Telegram message for %s %s.",
+                    announcement.source,
+                    announcement.company_name,
+                )
+        runtime.log_event(
+            "TELEGRAM_GENERIC_FAILURE_NOTICE",
+            status="PROCESSING",
+            telegram_enabled=sender is not None,
+            telegram_message_sent=notice_sent,
+            retry_scheduled=retry_scheduled,
+        )
         raise
 
 
@@ -647,33 +727,21 @@ def _send_live_extraction_output(
     if sender is None:
         return 0
     image_paths = generated_images.paths
-    if not image_paths and not generated_images.warnings and not generated_images.missing_sections:
-        return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
     if image_paths:
         sent = 0
         if sender.send_text(_mistral_image_intro_message(extraction, announcement, extracted_at, generated_images)):
             sent += 1
         sent += _send_generated_financial_images(sender, generated_images, announcement)
         return sent
-    if _is_non_financial_skip(extraction):
-        return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
-    if extraction.get("validation_allows_images") is False:
-        logging.warning(
-            "Telegram manual-verification warning suppressed for %s; validation_errors=%s",
-            announcement.company_name,
-            extraction.get("validation_errors") or [],
-        )
-        return 0
-    if generated_images.missing_sections:
-        if not generated_images.images and not generated_images.warnings:
-            return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
-        sent = 0
-        if sender.send_text(_mistral_image_intro_message(extraction, announcement, extracted_at, generated_images)):
-            sent += 1
-        sent += _send_generated_financial_images(sender, generated_images, announcement)
-        return sent
-    messages = format_mistral_output(extraction, announcement, extracted_at)
-    return _send_formatted_messages(sender, messages)
+    logging.warning(
+        "No financial image produced for %s; Telegram detail suppressed. parser_status=%s validation_errors=%s warnings=%s missing_sections=%s",
+        announcement.company_name,
+        extraction.get("parser_status") or extraction.get("status") or "",
+        extraction.get("validation_errors") or [],
+        generated_images.warnings,
+        generated_images.missing_sections,
+    )
+    return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
 
 
 def _job_run_date(announcement: Announcement) -> date:
@@ -793,35 +861,8 @@ def _send_local_mistral_result(sender: TelegramSender, announcement: Announcemen
 
     extraction = extract_pdf_with_gpt54(announcement.pdf_path, announcement)
     generated_images = generate_financial_images(extraction, announcement)
-    image_paths = generated_images.paths
     extracted_at = datetime.now()
-    if not image_paths and not generated_images.warnings and not generated_images.missing_sections:
-        return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
-    if image_paths:
-        sent = 0
-        if sender.send_text(_mistral_image_intro_message(extraction, announcement, extracted_at, generated_images)):
-            sent += 1
-        sent += _send_generated_financial_images(sender, generated_images, announcement)
-        return sent
-    if _is_non_financial_skip(extraction):
-        return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
-    if extraction.get("validation_allows_images") is False:
-        logging.warning(
-            "Telegram manual-verification warning suppressed for %s; validation_errors=%s",
-            announcement.company_name,
-            extraction.get("validation_errors") or [],
-        )
-        return 0
-    if generated_images.missing_sections:
-        if not generated_images.images and not generated_images.warnings:
-            return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
-        sent = 0
-        if sender.send_text(_mistral_image_intro_message(extraction, announcement, extracted_at, generated_images)):
-            sent += 1
-        sent += _send_generated_financial_images(sender, generated_images, announcement)
-        return sent
-    messages = format_mistral_output(extraction, announcement, extracted_at)
-    return _send_formatted_messages(sender, messages)
+    return _send_live_extraction_output(sender, extraction, announcement, extracted_at, generated_images)
 
 
 def _send_rendered_images(
@@ -909,6 +950,44 @@ def _is_non_financial_skip(extraction: dict[str, Any]) -> bool:
     return str(extraction.get("status") or extraction.get("parser_status") or "") == SKIPPED_NON_FINANCIAL_DISCLOSURE
 
 
+def _gpt_extraction_failure_reason(extraction: dict[str, Any]) -> str:
+    """Return the detailed internal GPT failure reason that must stay in logs."""
+
+    if _is_non_financial_skip(extraction):
+        return ""
+    if str(extraction.get("gpt_json_status") or "").strip().lower() != "failed":
+        return ""
+    message = str(extraction.get("parser_message") or "").strip()
+    if not message:
+        warnings = extraction.get("warnings") if isinstance(extraction.get("warnings"), list) else []
+        message = str(warnings[0] if warnings else "").strip()
+    return message or str(extraction.get("parser_status") or "GPT extraction returned no valid JSON")
+
+
+def _is_retryable_gpt_transport_failure(message: str) -> bool:
+    """Return true only for short-lived upstream/network failures, not long read timeouts."""
+
+    normalized = str(message or "").strip().lower()
+    if not normalized or "timed out" in normalized or "timeout" in normalized:
+        return False
+    retryable_markers = (
+        "http 502",
+        "http 503",
+        "http 504",
+        "status_code=502",
+        "status_code=503",
+        "status_code=504",
+        "connection termination",
+        "connection reset",
+        "forcibly closed by the remote host",
+        "remote host reset",
+        "getaddrinfo failed",
+        "name resolution",
+        "temporary failure in name resolution",
+    )
+    return any(marker in normalized for marker in retryable_markers)
+
+
 def _no_financial_data_message(extraction: dict[str, Any], announcement: Announcement) -> str:
     """Return the Telegram message for PDFs without financial data."""
 
@@ -934,12 +1013,15 @@ def _send_formatted_messages(sender: TelegramSender, messages: list[str]) -> int
 
 
 def _dedupe_announcements(announcements: list[Announcement]) -> list[Announcement]:
-    """Deduplicate live announcements by URL/id and same company/date before processing."""
+    """Deduplicate exact attachments without dropping distinct same-company PDFs."""
 
     seen_keys: set[str] = set()
-    seen_company_dates: set[tuple[str, str]] = set()
+    seen_urls: set[str] = set()
     deduped: list[Announcement] = []
     for announcement in announcements:
+        normalized_url = str(announcement.pdf_url or "").strip().lower()
+        if normalized_url and normalized_url in seen_urls:
+            continue
         key = "|".join(
             [
                 announcement.source.upper(),
@@ -950,19 +1032,9 @@ def _dedupe_announcements(announcements: list[Announcement]) -> list[Announcemen
         )
         if key in seen_keys:
             continue
-        company_date_key = (
-            _normalize_company_key(announcement.company_name),
-            _announcement_date_key(announcement.announcement_datetime),
-        )
-        if company_date_key in seen_company_dates:
-            logging.info(
-                "Skipping cross-exchange duplicate in current poll: %s %s",
-                announcement.source,
-                announcement.company_name,
-            )
-            continue
         seen_keys.add(key)
-        seen_company_dates.add(company_date_key)
+        if normalized_url:
+            seen_urls.add(normalized_url)
         deduped.append(announcement)
     return deduped
 

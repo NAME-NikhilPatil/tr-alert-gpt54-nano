@@ -182,10 +182,11 @@ def is_seen(announcement: Announcement, db_path: Path = DB_PATH) -> bool:
 
     init_seen_db(db_path)
     item_id = announcement_id(announcement)
+    pdf_url = str(announcement.pdf_url or "").strip()
     with _db_connection(db_path) as connection:
         row = connection.execute(
-            "SELECT 1 FROM seen_pdfs WHERE announcement_id = ? OR pdf_url = ? LIMIT 1",
-            (item_id, announcement.pdf_url),
+            "SELECT 1 FROM seen_pdfs WHERE announcement_id = ? OR (? <> '' AND pdf_url = ?) LIMIT 1",
+            (item_id, pdf_url, pdf_url),
         ).fetchone()
     return row is not None
 
@@ -195,6 +196,7 @@ def reserve_seen(announcement: Announcement, db_path: Path = DB_PATH) -> str:
 
     init_seen_db(db_path)
     item_id = announcement_id(announcement)
+    pdf_url = str(announcement.pdf_url or "").strip()
     with _db_connection(db_path) as connection:
         connection.execute(
             """
@@ -202,7 +204,7 @@ def reserve_seen(announcement: Announcement, db_path: Path = DB_PATH) -> str:
             (source, company_name, announcement_id, pdf_url, processed)
             VALUES (?, ?, ?, ?, 0)
             """,
-            (announcement.source.upper(), announcement.company_name, item_id, announcement.pdf_url),
+            (announcement.source.upper(), announcement.company_name, item_id, pdf_url or None),
         )
     return item_id
 
@@ -212,8 +214,9 @@ def mark_processed(announcement: Announcement, db_path: Path = DB_PATH) -> None:
 
     init_seen_db(db_path)
     item_id = announcement_id(announcement)
+    pdf_url = str(announcement.pdf_url or "").strip()
     with _db_connection(db_path) as connection:
         connection.execute(
-            "UPDATE seen_pdfs SET processed = 1 WHERE announcement_id = ? OR pdf_url = ?",
-            (item_id, announcement.pdf_url),
+            "UPDATE seen_pdfs SET processed = 1 WHERE announcement_id = ? OR (? <> '' AND pdf_url = ?)",
+            (item_id, pdf_url, pdf_url),
         )

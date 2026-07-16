@@ -433,9 +433,9 @@ def _telegram_status(
 ) -> str:
     image_count = len(generated.images) if generated else 0
     if not send_telegram:
-        return f"mock_sent:{image_count}"
+        return "disabled:no_send"
     if sender is None:
-        return "mock_sent:credentials_missing"
+        return "live_skipped:credentials_missing"
     if not generated or not generated.images:
         return "live_skipped:no_images"
     sent = 0
@@ -453,7 +453,7 @@ def _telegram_status_for_non_financial(
     sender: TelegramSender | None,
 ) -> str:
     if not send_telegram:
-        return "mock_skipped_non_financial:0"
+        return "disabled:no_send"
     if sender is None:
         return "live_skipped:credentials_missing"
     return "live_sent:1" if sender.send_text(non_financial_skip_message(extraction), queue_on_failure=False) else "live_failed:non_financial_skip"
@@ -488,7 +488,7 @@ def _should_escalate_after_first_pass(validation: Any, extraction: dict[str, Any
     routing = extraction.get("model_routing") if isinstance(extraction.get("model_routing"), dict) else {}
     if routing.get("reasoning_effort_requested") == "xhigh":
         return False
-    if str(os.environ.get("GPT54_USE_XHIGH_FOR_COMPLEX", "true")).strip().lower() in {"0", "false", "no", "off"}:
+    if str(os.environ.get("GPT54_USE_XHIGH_FOR_COMPLEX", "false")).strip().lower() in {"0", "false", "no", "off"}:
         return False
     joined = " ".join(str(item) for item in (getattr(validation, "issues", []) or []) + (getattr(validation, "warnings", []) or [])).lower()
     triggers = ("basis", "eps", "segment", "balance_sheet", "cash_flow", "formula")
@@ -508,7 +508,7 @@ def _should_escalate_after_zero_images(
     routing = extraction.get("model_routing") if isinstance(extraction.get("model_routing"), dict) else {}
     if routing.get("reasoning_effort_requested") == "xhigh":
         return False
-    return str(os.environ.get("GPT54_USE_XHIGH_FOR_COMPLEX", "true")).strip().lower() not in {"0", "false", "no", "off"}
+    return str(os.environ.get("GPT54_USE_XHIGH_FOR_COMPLEX", "false")).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _fallback_improved(original: Any, candidate: Any) -> bool:

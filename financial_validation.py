@@ -257,6 +257,8 @@ def _validate_llm_values_first_payload(extraction: dict[str, Any], announcement:
     approved_bs_cf_columns = data.get("approved_bs_cf_columns") if isinstance(data.get("approved_bs_cf_columns"), list) else []
     approved_segment_columns = data.get("approved_segment_columns") if isinstance(data.get("approved_segment_columns"), list) else []
 
+    issues.extend(_llm_values_first_total_income_issues(approved_pnl_rows, approved_pnl_columns))
+
     has_pnl = bool(approved_pnl_rows and approved_pnl_columns and any(row_has_value(row) for row in approved_pnl_rows))
     has_bs_cf = bool(approved_bs_cf_rows and approved_bs_cf_columns and any(row_has_value(row) for row in approved_bs_cf_rows))
     has_segment = bool(
@@ -304,6 +306,35 @@ def _validate_llm_values_first_payload(extraction: dict[str, Any], announcement:
         warnings=_dedupe(warnings),
         metadata=metadata,
     )
+
+
+def _llm_values_first_total_income_issues(
+    rows: list[dict[str, Any]],
+    columns: list[dict[str, Any]],
+) -> list[str]:
+    """Block render payloads whose returned income components cannot reconcile."""
+
+    mapped = _row_map(rows)
+    revenue_row = mapped.get("revenue") or mapped.get("revenuefromoperations")
+    other_row = mapped.get("otherincome")
+    total_row = mapped.get("totalincome")
+    if not revenue_row or not other_row or not total_row:
+        return []
+    periods = [str(column.get("period") or column.get("label") or "").strip() for column in columns]
+    issues: list[str] = []
+    for period in periods:
+        if not period:
+            continue
+        revenue = to_number((revenue_row.get("values") or {}).get(period))
+        other_income = to_number((other_row.get("values") or {}).get(period))
+        total_income = to_number((total_row.get("values") or {}).get(period))
+        if revenue is None or other_income is None or total_income is None:
+            continue
+        expected = revenue + other_income
+        tolerance = max(0.05, abs(total_income) * 0.005)
+        if abs(total_income - expected) > tolerance:
+            issues.append(f"llm_values_first_total_income_component_mismatch:{period}")
+    return issues
 
 
 def classify_validation_issues(issues: list[str], warnings: list[str] | None = None) -> list[str]:

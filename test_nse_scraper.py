@@ -24,13 +24,21 @@ class _JsonResponse:
 
 class _PdfResponse:
     headers = {"content-type": "application/pdf"}
-    content = b"%PDF-1.4\n% test\n"
+    content = b"%PDF-1.4\n% test\n%%EOF\n"
+
+
+class _IncompletePdfResponse:
+    headers = {"content-type": "application/pdf"}
+    content = b"%PDF-1.7\n1 0 obj<</Linearized 1/L 200>>\n%%EOF\n"
 
 
 class NseApiDiscoveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_successful_empty_api_result_does_not_launch_browser_fallback(self) -> None:
+    async def test_successful_empty_api_result_uses_browser_fallback(self) -> None:
         api_fetch = AsyncMock(return_value=[])
-        browser_fetch = AsyncMock(return_value=[])
+        browser_result = [
+            object(),
+        ]
+        browser_fetch = AsyncMock(return_value=browser_result)
 
         with (
             patch.object(nse_scraper, "_fetch_nse_via_api", api_fetch),
@@ -38,8 +46,8 @@ class NseApiDiscoveryTests(unittest.IsolatedAsyncioTestCase):
         ):
             announcements = await nse_scraper.fetch_nse_announcements(date(2026, 7, 15))
 
-        self.assertEqual([], announcements)
-        browser_fetch.assert_not_awaited()
+        self.assertEqual(browser_result, announcements)
+        browser_fetch.assert_awaited_once_with(date(2026, 7, 15))
 
     async def test_api_discovery_continues_when_homepage_warmup_is_forbidden(self) -> None:
         request = httpx.Request("GET", nse_scraper.NSE_BASE_URL)
@@ -97,6 +105,35 @@ class NseApiDiscoveryTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNotNone(downloaded)
             self.assertEqual(_PdfResponse.content, downloaded.read_bytes())
             self.assertEqual(2, mocked_request.await_count)
+
+    async def test_nse_pdf_download_retries_incomplete_linearized_response(self) -> None:
+        request = httpx.Request("GET", nse_scraper.NSE_BASE_URL)
+        response = httpx.Response(403, request=request)
+        warmup_error = httpx.HTTPStatusError(
+            "NSE homepage denied by Akamai",
+            request=request,
+            response=response,
+        )
+        mocked_request = AsyncMock(side_effect=[warmup_error, _IncompletePdfResponse(), _PdfResponse()])
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            with (
+                patch.object(utils, "Path", side_effect=lambda value: root / value),
+                patch.object(utils, "request_with_retries", mocked_request),
+                patch.object(utils, "_log_failed_download"),
+            ):
+                downloaded = await utils.download_pdf(
+                    "NSE",
+                    "Example Limited",
+                    date(2026, 7, 15),
+                    "https://nsearchives.nseindia.com/corporate/example.pdf",
+                    nse_scraper.NSE_HEADERS,
+                )
+
+            self.assertIsNotNone(downloaded)
+            self.assertEqual(_PdfResponse.content, downloaded.read_bytes())
+            self.assertEqual(3, mocked_request.await_count)
 
 
 if __name__ == "__main__":

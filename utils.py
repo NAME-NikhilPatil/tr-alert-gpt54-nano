@@ -170,6 +170,11 @@ def normalize_date(value: str) -> str:
 
     cleaned = re.sub(r"\s+", " ", value.strip())
     cleaned = re.sub(r"(\d{1,2})(st|nd|rd|th)\b", r"\1", cleaned, flags=re.I)
+    try:
+        iso_value = cleaned[:-1] + "+00:00" if cleaned.endswith("Z") else cleaned
+        return datetime.fromisoformat(iso_value).strftime("%d-%m-%Y")
+    except ValueError:
+        pass
     formats = (
         "%d-%m-%Y",
         "%d/%m/%Y",
@@ -189,6 +194,8 @@ def normalize_date(value: str) -> str:
         "%b %d %Y",
         "%d-%m-%Y %H:%M:%S",
         "%d/%m/%Y %H:%M:%S",
+        "%d-%b-%Y %H:%M:%S",
+        "%d-%B-%Y %H:%M:%S",
     )
     for fmt in formats:
         try:
@@ -196,7 +203,10 @@ def normalize_date(value: str) -> str:
         except ValueError:
             continue
 
-    match = re.search(r"(?P<day>\d{1,2})[-/.](?P<month>\d{1,2})[-/.](?P<year>\d{2,4})", cleaned)
+    match = re.search(
+        r"(?<!\d)(?P<day>\d{1,2})[-/.](?P<month>\d{1,2})[-/.](?P<year>\d{2,4})(?!\d)",
+        cleaned,
+    )
     if match:
         day = match.group("day")
         month = match.group("month")
@@ -297,6 +307,21 @@ async def download_pdf(
                 elif source == "BSE":
                     await request_with_retries(client, "GET", BSE_BASE_URL, headers=headers)
                 response = await request_with_retries(client, "GET", pdf_url, headers=headers)
+            validation_error = _pdf_payload_validation_error(response.content)
+            for download_attempt in range(2, 4):
+                if not validation_error:
+                    break
+                logging.warning(
+                    "Incomplete PDF response for %s (attempt %s/3): %s; retrying.",
+                    pdf_url,
+                    download_attempt - 1,
+                    validation_error,
+                )
+                await asyncio.sleep(2 ** (download_attempt - 2))
+                response = await request_with_retries(client, "GET", pdf_url, headers=headers)
+                validation_error = _pdf_payload_validation_error(response.content)
+            if validation_error:
+                raise RuntimeError(f"Incomplete PDF response after 3 attempts: {validation_error}")
             content_type = response.headers.get("content-type", "").lower()
             if "pdf" not in content_type and not response.content.startswith(b"%PDF"):
                 logging.warning("Attachment did not look like a PDF: %s", pdf_url)
@@ -306,6 +331,24 @@ async def download_pdf(
             _log_failed_download(source, company_name, announcement_date, pdf_url, exc)
             logging.exception("Failed to download PDF: %s", pdf_url)
             return None
+
+
+def _pdf_payload_validation_error(content: bytes) -> str:
+    """Return why a downloaded PDF is incomplete, or an empty string when usable."""
+
+    if not content.startswith(b"%PDF"):
+        return "missing PDF header"
+    linearized_length = re.search(rb"/Linearized\s+1(?:\.0)?\b.{0,160}?/L\s+(\d+)", content[:2048], re.DOTALL)
+    if linearized_length:
+        expected_length = int(linearized_length.group(1))
+        if len(content) < expected_length:
+            return f"linearized PDF declared {expected_length} bytes but received {len(content)}"
+    eof_position = content.rfind(b"%%EOF")
+    if eof_position < 0:
+        return "missing PDF EOF marker"
+    if len(content) - eof_position > 4096:
+        return f"PDF EOF marker is not near the end of the {len(content)}-byte response"
+    return ""
 
 
 def _log_failed_download(source: str, company_name: str, announcement_date: date, pdf_url: str, exc: Exception) -> None:

@@ -7,18 +7,24 @@ import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
 
 import httpx
 from PIL import Image
 
+import financial_pipeline as financial_pipeline_module
 import main as main_module
+import run_regression_dry as regression_dry_module
+import telegram_sender as telegram_sender_module
 
 from bs_cf_image import _cash_flow_only_rows, build_bs_cf_rows, clean_variable_label
+from db_manager import is_seen, reserve_seen
 from financial_cell_model import annotate_extraction_with_cell_model, canonical_cell_issues
-from financial_filing_classifier import SKIPPED_NON_FINANCIAL_DISCLOSURE, classify_pdf_filing
+from financial_filing_classifier import FINANCIAL_RESULTS, SKIPPED_NON_FINANCIAL_DISCLOSURE, classify_pdf_filing
 from financial_validation import validate_financial_payload
 from gpt54_extractor import (
+    GPT54_MAX_OUTPUT_TOKENS_DEFAULT,
     _apply_schema_defaults,
     _apply_verified_company_corrections,
     _call_responses_api,
@@ -27,12 +33,16 @@ from gpt54_extractor import (
     _llm_values_result_period,
     _normalize_gpt_payload,
     _normalize_llm_values_first_payload,
+    _pdf_request_timeout_seconds,
     _safe_reasoning_effort,
+    _should_retry_values_first_with_xhigh,
+    _temporary_gpt_route,
     extraction_json_schema,
     llm_values_first_json_schema,
     validate_gpt54_json,
 )
 from image_generator import (
+    GeneratedFinancialImages,
     _available_render_jobs,
     _period_caption_parts,
     _standalone_conflicts_with_consolidated_source,
@@ -50,10 +60,12 @@ from mistral_parser import (
     payload_from_ocr_markdown_tables,
 )
 from models import Announcement
+from pdf_job_worker import PdfJobWorkerConfig
 from pl_image import RenderBlockedError, build_pl_rows, change_for_row, format_display_cell, normalize_rows, render_pl_image, result_display_columns, row_has_value, rows_to_table
 from segment_image import build_segment_rows
 from table_repair_engine import repair_financial_payload
 from unit_detector import normalize_extraction_units
+from utils import normalize_date
 
 
 def main() -> int:
@@ -106,6 +118,9 @@ def main() -> int:
         test_llm_values_first_maps_nine_month_and_year_columns_by_position,
         test_llm_values_first_generic_pnl_order_company_cleanup_and_bs_reconcile,
         test_llm_values_first_recomputes_gross_profit_ebitda_and_margin,
+        test_llm_values_first_blocks_total_income_component_mismatch,
+        test_llm_values_first_suppresses_insurance_manufacturing_metrics,
+        test_llm_values_first_removes_segment_proxy_balance_sheet_rows,
         test_llm_values_first_revenue_order_total_income_note_and_liabilities_row,
         test_legacy_company_patches_disabled_by_default,
         test_canonical_cell_model_flags_eps_conversion,
@@ -130,6 +145,11 @@ def main() -> int:
         test_gradiente_verified_standalone_image_heavy_fallback,
         test_unclear_display_values_render_as_na,
         test_live_announcement_date_gate_skips_past_dates,
+        test_exchange_timestamp_formats_are_parsed_without_date_corruption,
+        test_dedupe_keeps_distinct_attachments_for_same_company_and_timestamp,
+        test_exchange_discovery_failure_does_not_block_other_exchange,
+        test_empty_pdf_url_does_not_dedupe_unrelated_announcements,
+        test_image_only_pdf_is_sent_to_gpt_vision_instead_of_locally_skipped,
         test_exchange_today_uses_india_timezone_at_utc_midnight_boundary,
         test_queued_previous_day_job_is_stale_after_ist_midnight,
         test_manual_verification_warning_is_client_friendly,
@@ -138,7 +158,22 @@ def main() -> int:
         test_llm_values_first_uses_first_quarter_date_as_result_period,
         test_llm_values_first_retries_truncated_json_with_full_pdf,
         test_responses_api_uses_dedicated_http_retries_for_503,
+        test_responses_api_defaults_to_one_http_attempt,
+        test_responses_api_background_mode_polls_same_job_to_completion,
+        test_responses_api_can_resume_stored_job_without_duplicate_post,
         test_reasoning_effort_is_clamped_to_high_or_xhigh,
+        test_complex_pdf_defaults_to_high_reasoning,
+        test_pdf_timeout_scales_for_large_long_hybrid_and_complex_inputs,
+        test_live_gpt_defaults_bound_latency_and_concurrency,
+        test_regression_dry_uses_the_http_retry_setting_read_by_the_client,
+        test_valid_values_first_payload_does_not_retry_with_xhigh_by_default,
+        test_live_output_uses_only_generic_no_data_message_for_any_no_image_problem,
+        test_live_worker_logs_transport_detail_but_sends_only_generic_message,
+        test_live_worker_defers_generic_notice_when_transient_503_will_be_requeued,
+        test_telegram_transport_errors_redact_bot_token,
+        test_runtime_data_dir_moves_relative_state_under_persistent_root,
+        test_no_telegram_status_is_not_reported_as_sent,
+        test_regression_console_text_is_safe_for_windows_cp1252,
         test_akme_warrant_pdf_is_structured_non_financial_skip,
     ]
     for test in tests:
@@ -1560,7 +1595,9 @@ def test_llm_values_first_recomputes_gross_profit_ebitda_and_margin() -> None:
                 {"label": "Revenue from operations", "values": {"FY26": "9188.805"}, "is_bold": True},
                 {"label": "Cost of materials consumed", "values": {"FY26": "9158.882"}},
                 {"label": "Changes in inventories", "values": {"FY26": "(63.177)"}},
+                {"label": "Project execution expenses", "values": {"FY26": "10"}},
                 {"label": "Gross Profit", "values": {"FY26": "(107.43)"}, "is_bold": True},
+                {"label": "Gross Profit Margin %", "values": {"FY26": "99%"}, "is_bold": True},
                 {"label": "Employee benefits expense", "values": {"FY26": "2.48"}},
                 {"label": "Other Expenses", "values": {"FY26": "3.16"}},
                 {"label": "EBITDA", "values": {"FY26": "(113.07)"}, "is_bold": True},
@@ -1577,9 +1614,10 @@ def test_llm_values_first_recomputes_gross_profit_ebitda_and_margin() -> None:
     table = rows_to_table(extraction["approved_pnl_rows"], extraction["approved_pnl_columns"], skip_margin_changes=True)
     by_label = {row[0]: row for row in table}
 
-    assert by_label["Gross Profit"][1] == "93"
-    assert by_label["EBITDA"][1] == "87"
-    assert by_label["EBITDA Margin"][1] == "0.95%"
+    assert by_label["Gross Profit"][1] == "83"
+    assert by_label["Gross Profit Margin %"][1] == "0.9%"
+    assert by_label["EBITDA"][1] == "77"
+    assert by_label["EBITDA Margin"][1] == "0.84%"
 
 
 def test_llm_values_first_revenue_order_total_income_note_and_liabilities_row() -> None:
@@ -2361,6 +2399,94 @@ def test_live_announcement_date_gate_skips_past_dates() -> None:
     assert not _extraction_date_matches_live_run({"board_meeting_date": "27th May 2026"}, current, run_date)
 
 
+def test_exchange_timestamp_formats_are_parsed_without_date_corruption() -> None:
+    assert normalize_date("2026-07-15T19:19:09.68") == "15-07-2026"
+    assert normalize_date("15-Jul-2026 20:56:14") == "15-07-2026"
+    assert main_module._parse_date_value("2026-07-15T19:19:09.68") == date(2026, 7, 15)
+    assert main_module._parse_date_value("15-Jul-2026 20:56:14") == date(2026, 7, 15)
+
+
+def test_dedupe_keeps_distinct_attachments_for_same_company_and_timestamp() -> None:
+    common = {
+        "source": "NSE",
+        "company_name": "Example Limited",
+        "announcement_datetime": "15-Jul-2026 20:56:14",
+        "subject": "Outcome of Board Meeting",
+    }
+    announcements = [
+        Announcement(identifier="one", pdf_url="https://example.test/one.pdf", **common),
+        Announcement(identifier="two", pdf_url="https://example.test/two.pdf", **common),
+    ]
+
+    assert main_module._dedupe_announcements(announcements) == announcements
+
+
+def test_exchange_discovery_failure_does_not_block_other_exchange() -> None:
+    bse_item = Announcement(
+        source="BSE",
+        company_name="BSE Example Limited",
+        identifier="500001",
+        announcement_datetime="2026-07-15T19:19:09.68",
+        subject="Outcome of Board Meeting",
+        pdf_url="https://example.test/bse.pdf",
+    )
+    with (
+        patch("main.fetch_nse_announcements", new=AsyncMock(side_effect=RuntimeError("NSE unavailable"))),
+        patch("main.fetch_bse_announcements", new=AsyncMock(return_value=[bse_item])),
+    ):
+        nse_items, bse_items = __import__("asyncio").run(
+            main_module._fetch_exchange_announcements(date(2026, 7, 15))
+        )
+
+    assert nse_items == []
+    assert bse_items == [bse_item]
+
+
+def test_empty_pdf_url_does_not_dedupe_unrelated_announcements() -> None:
+    first = Announcement(
+        source="BSE",
+        company_name="First Limited",
+        identifier="500001",
+        announcement_datetime="2026-07-15T19:00:00",
+        subject="Outcome of Board Meeting",
+        pdf_url="",
+    )
+    second = Announcement(
+        source="BSE",
+        company_name="Second Limited",
+        identifier="500002",
+        announcement_datetime="2026-07-15T19:01:00",
+        subject="Outcome of Board Meeting",
+        pdf_url="",
+    )
+    with TemporaryDirectory() as temp_dir:
+        db_path = Path(temp_dir) / "seen.db"
+        reserve_seen(first, db_path)
+        assert not is_seen(second, db_path)
+        reserve_seen(second, db_path)
+        assert is_seen(second, db_path)
+
+
+def test_image_only_pdf_is_sent_to_gpt_vision_instead_of_locally_skipped() -> None:
+    announcement = Announcement(
+        source="NSE",
+        company_name="Scanned Results Limited",
+        identifier="SCANNED",
+        announcement_datetime="15-Jul-2026 20:56:14",
+        subject="Outcome of Board Meeting",
+        pdf_url="https://example.test/scanned.pdf",
+    )
+    with patch(
+        "financial_filing_classifier.extract_pdf_text",
+        return_value=("", 26, 26, [20, 21, 22, 23, 24, 25, 26]),
+    ):
+        classification = classify_pdf_filing("scanned-results.pdf", announcement)
+
+    assert classification.filing_type == FINANCIAL_RESULTS
+    assert classification.financial_images_required is True
+    assert classification.confidence == "low"
+
+
 def test_exchange_today_uses_india_timezone_at_utc_midnight_boundary() -> None:
     exchange_today = getattr(main_module, "_exchange_today", None)
     assert callable(exchange_today), "main._exchange_today is required"
@@ -2540,6 +2666,93 @@ def test_responses_api_uses_dedicated_http_retries_for_503() -> None:
     assert sleep_mock.call_count == 2
 
 
+def test_responses_api_defaults_to_one_http_attempt() -> None:
+    request = httpx.Request("POST", "https://example.openai.azure.com/openai/v1/responses")
+    env = {
+        "GPT54_RESPONSES_URL": str(request.url),
+        "GPT54_API_KEY": "test-key",
+        "GPT54_USE_RESPONSE_FORMAT": "false",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        with patch(
+            "gpt54_extractor.httpx.post",
+            side_effect=httpx.ReadTimeout("read timed out", request=request),
+        ) as post_mock:
+            with patch("gpt54_extractor.time.sleep") as sleep_mock:
+                try:
+                    _call_responses_api("Return JSON.", "ping")
+                except RuntimeError:
+                    pass
+                else:
+                    raise AssertionError("transport timeout should raise RuntimeError")
+
+    assert post_mock.call_count == 1
+    assert sleep_mock.call_count == 0
+
+
+def test_responses_api_background_mode_polls_same_job_to_completion() -> None:
+    request = httpx.Request("POST", "https://example.openai.azure.com/openai/v1/responses")
+    create = httpx.Response(
+        200,
+        request=request,
+        json={"id": "resp-background", "status": "queued", "output": []},
+    )
+    poll_request = httpx.Request("GET", f"{request.url}/resp-background")
+    poll_503 = httpx.Response(503, request=poll_request, text="temporary upstream reset")
+    completed = httpx.Response(
+        200,
+        request=poll_request,
+        json={"id": "resp-background", "status": "completed", "output": []},
+    )
+    env = {
+        "GPT54_RESPONSES_URL": str(request.url),
+        "GPT54_API_KEY": "test-key",
+        "GPT54_BACKGROUND_MODE": "true",
+        "GPT54_BACKGROUND_POLL_SECONDS": "0",
+        "GPT54_USE_RESPONSE_FORMAT": "false",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        with (
+            patch("gpt54_extractor.httpx.post", return_value=create) as post_mock,
+            patch("gpt54_extractor.httpx.get", side_effect=[poll_503, completed]) as get_mock,
+            patch("gpt54_extractor.time.sleep"),
+        ):
+            result = _call_responses_api("Return JSON.", "ping")
+
+    assert result["status"] == "completed"
+    assert post_mock.call_count == 1
+    assert get_mock.call_count == 2
+
+
+def test_responses_api_can_resume_stored_job_without_duplicate_post() -> None:
+    request = httpx.Request("POST", "https://example.openai.azure.com/openai/v1/responses")
+    poll_request = httpx.Request("GET", f"{request.url}/resp-existing")
+    completed = httpx.Response(
+        200,
+        request=poll_request,
+        json={"id": "resp-existing", "status": "completed", "output": []},
+    )
+    env = {
+        "GPT54_RESPONSES_URL": str(request.url),
+        "GPT54_API_KEY": "test-key",
+        "GPT54_RESUME_RESPONSE_ID_ONCE": "resp-existing",
+        "GPT54_BACKGROUND_POLL_SECONDS": "0",
+        "GPT54_USE_RESPONSE_FORMAT": "false",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        with (
+            patch("gpt54_extractor.httpx.post") as post_mock,
+            patch("gpt54_extractor.httpx.get", return_value=completed) as get_mock,
+            patch("gpt54_extractor.time.sleep"),
+        ):
+            result = _call_responses_api("Return JSON.", "ping")
+
+    assert result["status"] == "completed"
+    assert post_mock.call_count == 0
+    assert get_mock.call_count == 1
+    assert "GPT54_RESUME_RESPONSE_ID_ONCE" not in os.environ
+
+
 def test_reasoning_effort_is_clamped_to_high_or_xhigh() -> None:
     assert _safe_reasoning_effort("low") == "high"
     assert _safe_reasoning_effort("medium") == "high"
@@ -2549,6 +2762,380 @@ def test_reasoning_effort_is_clamped_to_high_or_xhigh() -> None:
         type("Complexity", (), {"complex_pdf": False, "complexity_score": 0, "triggers": []})(),
     )
     assert route["reasoning_effort_requested"] == "high"
+
+
+def test_complex_pdf_defaults_to_high_reasoning() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        route = _financial_model_route(
+            type("Classification", (), {"filing_type": "FINANCIAL_RESULTS"})(),
+            type(
+                "Complexity",
+                (),
+                {"complex_pdf": True, "complexity_score": 4, "triggers": ["many_pages"]},
+            )(),
+        )
+
+    assert route["reasoning_effort_requested"] == "high"
+
+
+def test_pdf_timeout_scales_for_large_long_hybrid_and_complex_inputs() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        assert _pdf_request_timeout_seconds(1 * 1024 * 1024, 5, [], 2) == 1800
+        assert _pdf_request_timeout_seconds(10 * 1024 * 1024, 10, [], 5) == 2700
+
+    env = {
+        "GPT54_TIMEOUT_SECONDS": "900",
+        "GPT54_COMPLEX_TIMEOUT_SECONDS": "1800",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        assert _pdf_request_timeout_seconds(1 * 1024 * 1024, 5, [], 2) == 900
+        assert _pdf_request_timeout_seconds(10 * 1024 * 1024, 5, [], 2) == 1800
+        assert _pdf_request_timeout_seconds(1 * 1024 * 1024, 42, [], 2) == 1800
+        assert _pdf_request_timeout_seconds(1 * 1024 * 1024, 5, [3], 2) == 1800
+        assert _pdf_request_timeout_seconds(1 * 1024 * 1024, 5, [], 5) == 1800
+
+        request = httpx.Request("POST", "https://example.openai.azure.com/openai/v1/responses")
+        response = httpx.Response(200, request=request, json={"id": "response-ok", "output": []})
+        api_env = {
+            **env,
+            "GPT54_RESPONSES_URL": str(request.url),
+            "GPT54_API_KEY": "test-key",
+            "GPT54_USE_RESPONSE_FORMAT": "false",
+        }
+        with patch.dict(os.environ, api_env, clear=True):
+            with _temporary_gpt_route(
+                {
+                    "model_requested": "gpt-5.4-nano",
+                    "reasoning_effort_requested": "high",
+                    "timeout_seconds": 1800,
+                }
+            ):
+                with patch("gpt54_extractor.httpx.post", return_value=response) as post_mock:
+                    result = _call_responses_api("Return JSON.", "ping")
+
+        assert post_mock.call_args.kwargs["timeout"] == 1800
+        assert result["_routing_metadata"]["timeout_seconds"] == 1800
+        assert result["_routing_metadata"]["max_output_tokens"] == 48000
+        assert result["_routing_metadata"]["configured_http_attempts"] == 1
+
+
+def test_live_gpt_defaults_bound_latency_and_concurrency() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        main_module._apply_live_pipeline_env_defaults()
+        assert os.environ["MAX_CONCURRENT_PDF_JOBS"] == "1"
+        assert os.environ["PDF_JOB_RETRY_LIMIT"] == "1"
+        assert os.environ["GPT54_TIMEOUT_SECONDS"] == "1800"
+        assert os.environ["GPT54_COMPLEX_TIMEOUT_SECONDS"] == "2700"
+        assert os.environ["GPT54_HTTP_RETRIES"] == "1"
+        assert os.environ["GPT54_MAX_OUTPUT_TOKENS"] == "48000"
+        assert os.environ["GPT54_USE_XHIGH_FOR_COMPLEX"] == "false"
+
+    worker_defaults = PdfJobWorkerConfig()
+    assert worker_defaults.max_concurrent_pdf_jobs == 1
+    assert worker_defaults.retry_limit == 1
+    assert GPT54_MAX_OUTPUT_TOKENS_DEFAULT == 48000
+
+
+def test_regression_dry_uses_the_http_retry_setting_read_by_the_client() -> None:
+    with patch.dict(os.environ, {}, clear=True):
+        regression_dry_module._force_safe_env()
+        assert os.environ["GPT54_HTTP_RETRIES"] == "1"
+        assert os.environ["GPT54_TIMEOUT_SECONDS"] == "1800"
+        assert os.environ["GPT54_COMPLEX_TIMEOUT_SECONDS"] == "2700"
+        assert os.environ["GPT54_MAX_OUTPUT_TOKENS"] == "48000"
+
+
+def test_valid_values_first_payload_does_not_retry_with_xhigh_by_default() -> None:
+    payload = {
+        "llm_values_first_mode": True,
+        "gpt_json_status": "valid",
+        "warnings": ["llm_values_first_ebitda_consistency_adjusted:Q1 FY27"],
+    }
+    with patch.dict(os.environ, {}, clear=True):
+        assert _should_retry_values_first_with_xhigh(payload) is False
+
+
+def test_live_output_uses_only_generic_no_data_message_for_any_no_image_problem() -> None:
+    class Sender:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def send_text(self, message: str) -> bool:
+            self.messages.append(message)
+            return True
+
+    sender = Sender()
+    announcement = Announcement(
+        source="NSE",
+        company_name="Example Limited",
+        identifier="example",
+        announcement_datetime="15-Jul-2026 20:56:14",
+        subject="Outcome of Board Meeting",
+        pdf_url="https://example.test/example.pdf",
+    )
+    generated = GeneratedFinancialImages(
+        images=[],
+        warnings=["specific validation error must remain in logs"],
+        currency_unit="",
+        statement_basis="unknown",
+        missing_sections=["P&L"],
+    )
+    extraction = {
+        "company_name": "Example Limited",
+        "source": "NSE",
+        "validation_allows_images": False,
+        "validation_errors": ["specific validation error must remain in logs"],
+    }
+
+    sent = main_module._send_live_extraction_output(
+        sender,
+        extraction,
+        announcement,
+        datetime(2026, 7, 15, 20, 56, 14),
+        generated,
+    )
+
+    assert sent == 1
+    assert sender.messages == [
+        "Example Limited\nSource: NSE\nFinancial data is not available in the PDF."
+    ]
+
+
+def test_live_worker_logs_transport_detail_but_sends_only_generic_message() -> None:
+    class Sender:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def send_text(self, message: str) -> bool:
+            self.messages.append(message)
+            return True
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def log_event(self, event: str, **details: object) -> None:
+            self.events.append((event, details))
+
+    extraction = {
+        "company_name": "Example Limited",
+        "source": "NSE",
+        "gpt_json_status": "failed",
+        "parser_status": "gpt54_llm_values_first_error",
+        "parser_message": "secret upstream HTTP 503 transport failure",
+    }
+    sender = Sender()
+    runtime = Runtime()
+
+    with TemporaryDirectory() as temp_dir:
+        pdf_path = Path(temp_dir) / "example.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        job = SimpleNamespace(
+            id=1,
+            attempt_count=2,
+            exchange="NSE",
+            company_name="Example Limited",
+            identifier="example",
+            announcement_datetime=main_module._exchange_today().isoformat(),
+            subject="Outcome of Board Meeting",
+            pdf_url="https://example.test/example.pdf",
+            local_pdf_path=str(pdf_path),
+        )
+        with (
+            patch("main.extract_pdf_with_gpt54", return_value=extraction),
+            patch("main.mark_processed"),
+        ):
+            try:
+                main_module._process_live_pdf_job(job, runtime, sender)
+            except RuntimeError as exc:
+                assert "secret upstream HTTP 503" in str(exc)
+            else:
+                raise AssertionError("terminal GPT failure must remain a failed job in logs")
+
+    assert sender.messages == [
+        "Example Limited\nSource: NSE\nFinancial data is not available in the PDF."
+    ]
+    assert all("503" not in message for message in sender.messages)
+    failed_events = [details for event, details in runtime.events if event == "GPT_REQUEST_FAILED"]
+    assert failed_events and "secret upstream HTTP 503" in str(failed_events[0].get("error"))
+
+
+def test_live_worker_defers_generic_notice_when_transient_503_will_be_requeued() -> None:
+    assert main_module._is_retryable_gpt_transport_failure(
+        "GPT-5.4 Responses API transport error: [WinError 10054] "
+        "An existing connection was forcibly closed by the remote host"
+    )
+
+    class Sender:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def send_text(self, message: str) -> bool:
+            self.messages.append(message)
+            return True
+
+    class Runtime:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, dict[str, object]]] = []
+
+        def log_event(self, event: str, **details: object) -> None:
+            self.events.append((event, details))
+
+    extraction = {
+        "company_name": "Example Limited",
+        "source": "NSE",
+        "gpt_json_status": "failed",
+        "parser_status": "gpt54_llm_values_first_error",
+        "parser_message": "upstream HTTP 503 connection termination",
+    }
+    sender = Sender()
+    runtime = Runtime()
+
+    with TemporaryDirectory() as temp_dir:
+        pdf_path = Path(temp_dir) / "example.pdf"
+        pdf_path.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        job = SimpleNamespace(
+            id=1,
+            attempt_count=1,
+            exchange="NSE",
+            company_name="Example Limited",
+            identifier="example",
+            announcement_datetime=main_module._exchange_today().isoformat(),
+            subject="Outcome of Board Meeting",
+            pdf_url="https://example.test/example.pdf",
+            local_pdf_path=str(pdf_path),
+        )
+        with (
+            patch.dict(os.environ, {"PDF_JOB_RETRY_LIMIT": "1"}, clear=False),
+            patch("main.extract_pdf_with_gpt54", return_value=extraction),
+            patch("main.mark_processed"),
+        ):
+            try:
+                main_module._process_live_pdf_job(job, runtime, sender)
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("transient GPT failure must return to the queue worker")
+
+    assert sender.messages == []
+    notices = [details for event, details in runtime.events if event == "TELEGRAM_GENERIC_FAILURE_NOTICE"]
+    assert notices and notices[0].get("retry_scheduled") is True
+
+
+def test_llm_values_first_blocks_total_income_component_mismatch() -> None:
+    extraction = {
+        "company_name": "Mismatch Limited",
+        "llm_values_first_mode": True,
+        "approved_pnl_columns": [{"kind": "value", "label": "Q1", "period": "Q1"}],
+        "approved_pnl_rows": [
+            {"label": "Revenue", "values": {"Q1": "100"}},
+            {"label": "Other Income", "values": {"Q1": "20"}},
+            {"label": "Total Income", "values": {"Q1": "90"}},
+            {"label": "Profit Before Tax", "values": {"Q1": "10"}},
+        ],
+        "approved_bs_cf_rows": [],
+        "approved_bs_cf_columns": [],
+        "approved_segment_rows": [],
+        "approved_segment_columns": [],
+        "render_decision": {"should_render": True},
+    }
+    result = validate_financial_payload(extraction)
+    assert result.allows_images is False
+    assert "llm_values_first_total_income_component_mismatch:Q1" in result.issues
+
+
+def test_llm_values_first_suppresses_insurance_manufacturing_metrics() -> None:
+    payload = _specialized_values_first_payload()
+    payload["pnl_image"]["rows"] = [  # type: ignore[index]
+        {"label": "Revenue", "values": {"Q1": "100"}, "source_note": "Premium Earned (Net)"},
+        {"label": "Other Income", "values": {"Q1": "20"}},
+        {"label": "Total Income", "values": {"Q1": "120"}},
+        {"label": "Claims Paid", "values": {"Q1": "60"}},
+        {"label": "Gross Profit", "values": {"Q1": "40"}},
+        {"label": "Gross Profit Margin %", "values": {"Q1": "40%"}},
+        {"label": "EBITDA", "values": {"Q1": "30"}},
+        {"label": "EBITDA Margin %", "values": {"Q1": "30%"}},
+        {"label": "Profit Before Tax", "values": {"Q1": "10"}},
+    ]
+    extraction = _normalize_llm_values_first_payload(payload, Path("insurance.pdf"), None, {})
+    labels = [str(row.get("label") or "") for row in extraction["approved_pnl_rows"]]
+    assert "Gross Profit" not in labels
+    assert "Gross Profit Margin %" not in labels
+    assert "EBITDA" not in labels
+    assert "EBITDA Margin %" not in labels
+
+
+def test_llm_values_first_removes_segment_proxy_balance_sheet_rows() -> None:
+    payload = _specialized_values_first_payload()
+    payload["bs_cf_image"] = {
+        "title": "Proxy BS",
+        "columns": ["Q1"],
+        "balance_sheet_rows": [
+            {"label": "Total Assets (segment total)", "values": {"Q1": "100"}, "source_note": "proxy from Segment table"},
+            {"label": "Total Liabilities (segment total)", "values": {"Q1": "80"}, "source_note": "proxy from Segment table"},
+        ],
+        "cash_flow_rows": [],
+        "warnings": [],
+    }
+    extraction = _normalize_llm_values_first_payload(payload, Path("segment_proxy.pdf"), None, {})
+    assert extraction["approved_bs_cf_rows"] == []
+    assert extraction["balance_sheet_required"] is False
+
+
+def _specialized_values_first_payload() -> dict[str, object]:
+    return {
+        "company_name": "Specialized Financial Limited",
+        "selected_basis": "single statement",
+        "source_unit": "Rs in Cr",
+        "display_unit": "Rs in Cr",
+        "currency": "INR",
+        "periods": ["Q1"],
+        "pnl_image": {
+            "title": "Results",
+            "columns": ["Q1"],
+            "rows": [
+                {"label": "Revenue", "values": {"Q1": "100"}},
+                {"label": "Profit Before Tax", "values": {"Q1": "10"}},
+            ],
+            "warnings": [],
+        },
+        "bs_cf_image": {"title": "", "columns": [], "balance_sheet_rows": [], "cash_flow_rows": [], "warnings": []},
+        "segment_image": {"required": False, "title": "", "columns": [], "rows": [], "warnings": []},
+        "global_warnings": [],
+        "render_decision": {"should_render": True, "reason": ""},
+    }
+
+
+def test_telegram_transport_errors_redact_bot_token() -> None:
+    token = "123456:super-secret-bot-token"
+    message = f"ConnectError requesting https://api.telegram.org/bot{token}/sendMessage"
+    redacted = telegram_sender_module._redact_telegram_error(message, token)
+    assert token not in redacted
+    assert "[redacted-bot-token]" in redacted
+
+
+def test_runtime_data_dir_moves_relative_state_under_persistent_root() -> None:
+    original = Path.cwd()
+    with TemporaryDirectory() as temp_dir:
+        with patch.dict(os.environ, {"TR_ALERT_DATA_DIR": temp_dir}, clear=False):
+            try:
+                selected = main_module._configure_runtime_data_dir()
+                assert selected == Path(temp_dir).resolve()
+                assert Path.cwd() == Path(temp_dir).resolve()
+            finally:
+                os.chdir(original)
+
+
+def test_no_telegram_status_is_not_reported_as_sent() -> None:
+    announcement = Announcement("NSE", "Example Limited", "EXAMPLE", "2026-07-16", "Results", "https://example.test/a.pdf")
+    status = financial_pipeline_module._telegram_status(False, None, announcement, None)
+    assert status == "disabled:no_send"
+
+
+def test_regression_console_text_is_safe_for_windows_cp1252() -> None:
+    rendered = regression_dry_module._console_safe("Unit: ₹ Cr", "cp1252")
+    assert rendered == "Unit: ? Cr"
+    assert regression_dry_module._console_safe("plain text") == "plain text"
 
 
 def test_akme_warrant_pdf_is_structured_non_financial_skip() -> None:

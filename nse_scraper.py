@@ -44,7 +44,9 @@ async def fetch_nse_announcements(run_date: date) -> list[Announcement]:
 
     try:
         announcements = await _fetch_nse_via_api(run_date)
-        return announcements
+        if announcements:
+            return announcements
+        logging.warning("NSE API returned no matching announcements; falling back to browser scraping.")
     except httpx.HTTPStatusError as exc:
         status = exc.response.status_code if exc.response is not None else 0
         if status == 403:

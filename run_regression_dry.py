@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import os
+import sys
 from dataclasses import asdict, dataclass
 from datetime import datetime
 from pathlib import Path
@@ -111,7 +112,7 @@ def main() -> int:
         )
         row = _row_from_result(result, output_root)
         rows.append(row)
-        print(_tsv(row))
+        print(_console_safe(_tsv(row)))
 
     _write_reports(output_root, rows)
     _print_summary(output_root, rows)
@@ -126,16 +127,21 @@ def _force_safe_env() -> None:
     os.environ["STRICT_VALIDATION"] = "false"
     os.environ["RENDER_WITH_WARNINGS"] = "false"
     os.environ["RENDER_ONLY_WHEN_SAFE"] = "false"
-    # Dry runs should fail fast enough for manual feedback loops; production
-    # timeout policy can stay in .env for the live bot.
-    os.environ["GPT54_TIMEOUT_SECONDS"] = "600"
-    os.environ["GPT54_RETRIES"] = "1"
+    # Match production so large, long, scanned, and hybrid PDFs have enough
+    # time to complete during a representative no-Telegram dry run.
+    os.environ["GPT54_TIMEOUT_SECONDS"] = "1800"
+    os.environ["GPT54_COMPLEX_TIMEOUT_SECONDS"] = "2700"
+    os.environ["GPT54_HTTP_RETRIES"] = "1"
+    os.environ["GPT54_BACKGROUND_MODE"] = "true"
+    os.environ["GPT54_BACKGROUND_POLL_SECONDS"] = "5"
     os.environ.setdefault("PRIMARY_MODEL", os.environ.get("GPT54_MODEL", "gpt-5.4-nano"))
-    os.environ.setdefault("MODEL_REASONING_EFFORT", "high")
-    os.environ.setdefault("GPT54_DEFAULT_REASONING_EFFORT", "high")
-    os.environ.setdefault("GPT54_COMPLEX_REASONING_EFFORT", "xhigh")
-    os.environ.setdefault("GPT54_OUTPUT_TOKEN_BUDGET", "128000")
-    os.environ.setdefault("GPT54_MAX_OUTPUT_TOKENS", "128000")
+    os.environ["MODEL_REASONING_EFFORT"] = "high"
+    os.environ["GPT54_DEFAULT_REASONING_EFFORT"] = "high"
+    os.environ["GPT54_COMPLEX_REASONING_EFFORT"] = "high"
+    os.environ["GPT54_USE_XHIGH_FOR_COMPLEX"] = "false"
+    os.environ["GPT54_RETRY_XHIGH_ON_VALUES_FIRST_WARNINGS"] = "false"
+    os.environ["GPT54_OUTPUT_TOKEN_BUDGET"] = "48000"
+    os.environ["GPT54_MAX_OUTPUT_TOKENS"] = "48000"
 
 
 def _load_dotenv(path: Path) -> None:
@@ -497,6 +503,13 @@ def _tsv(row: DryRunRow) -> str:
         row.failure_report_path,
     ]
     return "\t".join(value.replace("\t", " ").replace("\n", " ") for value in values)
+
+
+def _console_safe(value: str, encoding: str | None = None) -> str:
+    """Return text printable by the active console without raising UnicodeEncodeError."""
+
+    target_encoding = encoding or getattr(sys.stdout, "encoding", None) or "utf-8"
+    return str(value).encode(target_encoding, errors="replace").decode(target_encoding, errors="replace")
 
 
 if __name__ == "__main__":

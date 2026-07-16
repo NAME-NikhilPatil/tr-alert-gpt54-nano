@@ -47,7 +47,7 @@ from utils import normalize_date
 
 
 GPT54_MODEL_DEFAULT = "gpt-5.4-nano"
-GPT54_MAX_OUTPUT_TOKENS_DEFAULT = 128000
+GPT54_MAX_OUTPUT_TOKENS_DEFAULT = 48000
 GPT54_REASONING_EFFORT_DEFAULT = "high"
 OPENAI_RESPONSES_URL = "https://api.openai.com/v1/responses"
 
@@ -664,6 +664,12 @@ def extract_pdf_with_gpt54(
         )
 
     route = _financial_model_route(classification, complexity, force_complex_reason=force_complex_reason)
+    route["timeout_seconds"] = _pdf_request_timeout_seconds(
+        path.stat().st_size,
+        complexity.page_count,
+        complexity.image_heavy_pages,
+        complexity.complexity_score,
+    )
     with _temporary_gpt_route(route):
         payload = _extract_pdf_with_current_mode(path, announcement, ocr_payload)
     if (
@@ -712,7 +718,7 @@ def extract_pdf_with_gpt54(
 
 
 def _should_retry_values_first_with_xhigh(payload: dict[str, Any]) -> bool:
-    if not _truthy_env("GPT54_RETRY_XHIGH_ON_VALUES_FIRST_WARNINGS", True):
+    if not _truthy_env("GPT54_RETRY_XHIGH_ON_VALUES_FIRST_WARNINGS", False):
         return False
     if not isinstance(payload, dict) or not payload.get("llm_values_first_mode"):
         return False
@@ -821,8 +827,8 @@ def _financial_model_route(
         triggers.append(force_complex_reason)
     model = os.environ.get("GPT54_COMPLEX_MODEL" if complex_pdf else "GPT54_SIMPLE_MODEL") or "gpt-5.4-nano"
     default_reasoning = _safe_reasoning_effort(os.environ.get("GPT54_DEFAULT_REASONING_EFFORT", "high"), allow_xhigh=False)
-    complex_reasoning = _safe_reasoning_effort(os.environ.get("GPT54_COMPLEX_REASONING_EFFORT", "xhigh"))
-    reasoning = complex_reasoning if complex_pdf and _truthy_env("GPT54_USE_XHIGH_FOR_COMPLEX", True) else default_reasoning
+    complex_reasoning = _safe_reasoning_effort(os.environ.get("GPT54_COMPLEX_REASONING_EFFORT", "high"))
+    reasoning = complex_reasoning if complex_pdf and _truthy_env("GPT54_USE_XHIGH_FOR_COMPLEX", False) else default_reasoning
     return {
         "filing_type": classification.filing_type,
         "complex_pdf": complex_pdf,
@@ -834,14 +840,42 @@ def _financial_model_route(
     }
 
 
+def _pdf_request_timeout_seconds(
+    file_size_bytes: int,
+    page_count: int,
+    image_heavy_pages: list[int],
+    complexity_score: int,
+) -> float:
+    """Choose a request timeout from PDF size, length, format, and complexity."""
+
+    try:
+        base_timeout = max(1.0, float(os.environ.get("GPT54_TIMEOUT_SECONDS", "1800")))
+    except ValueError:
+        base_timeout = 1800.0
+    try:
+        complex_timeout = max(base_timeout, float(os.environ.get("GPT54_COMPLEX_TIMEOUT_SECONDS", "2700")))
+    except ValueError:
+        complex_timeout = max(base_timeout, 2700.0)
+    complex_request = (
+        int(file_size_bytes or 0) >= 8 * 1024 * 1024
+        or int(page_count or 0) > 20
+        or bool(image_heavy_pages)
+        or int(complexity_score or 0) >= 5
+    )
+    return complex_timeout if complex_request else base_timeout
+
+
 @contextmanager
 def _temporary_gpt_route(route: dict[str, Any]):
     """Apply route overrides to the existing env-based GPT caller."""
 
     old_model = os.environ.get("GPT54_ACTIVE_MODEL")
     old_reasoning = os.environ.get("GPT54_ACTIVE_REASONING_EFFORT")
+    old_timeout = os.environ.get("GPT54_ACTIVE_TIMEOUT_SECONDS")
     os.environ["GPT54_ACTIVE_MODEL"] = str(route.get("model_requested") or "gpt-5.4-nano")
     os.environ["GPT54_ACTIVE_REASONING_EFFORT"] = _safe_reasoning_effort(route.get("reasoning_effort_requested") or "high")
+    if route.get("timeout_seconds") is not None:
+        os.environ["GPT54_ACTIVE_TIMEOUT_SECONDS"] = str(route["timeout_seconds"])
     try:
         yield
     finally:
@@ -853,6 +887,10 @@ def _temporary_gpt_route(route: dict[str, Any]):
             os.environ.pop("GPT54_ACTIVE_REASONING_EFFORT", None)
         else:
             os.environ["GPT54_ACTIVE_REASONING_EFFORT"] = old_reasoning
+        if old_timeout is None:
+            os.environ.pop("GPT54_ACTIVE_TIMEOUT_SECONDS", None)
+        else:
+            os.environ["GPT54_ACTIVE_TIMEOUT_SECONDS"] = old_timeout
 
 
 def _attach_routing_metadata(
@@ -1121,6 +1159,7 @@ def _normalize_llm_values_first_payload(
         heading="Balance Sheet Variables",
         default_section="Balance Sheet",
     )
+    proxy_warnings = _remove_segment_proxy_balance_sheet_rows(bs_rows)
     cf_rows = _llm_values_grouped_rows(
         bs_cf_payload.get("cash_flow_rows"),
         heading="Cash Flow Variables",
@@ -1145,7 +1184,7 @@ def _normalize_llm_values_first_payload(
 
     periods = _clean_string_list(payload.get("periods"))
     result_period = _llm_values_result_period(periods, pnl_columns)
-    warnings = _llm_values_warnings(payload, pnl_rows, bs_cf_rows, segment_rows) + postprocess_warnings
+    warnings = _llm_values_warnings(payload, pnl_rows, bs_cf_rows, segment_rows) + proxy_warnings + postprocess_warnings
     render_decision = payload.get("render_decision") if isinstance(payload.get("render_decision"), dict) else {}
     company = _clean_llm_company_name(
         payload.get("company_name")
@@ -1890,10 +1929,43 @@ def _postprocess_llm_values_first_rows(
     warnings.extend(_fix_llm_values_first_gross_profit_rows(pnl_rows, pnl_columns))
     warnings.extend(_fix_llm_values_first_total_expenses_excluding_rows(pnl_rows, pnl_columns))
     warnings.extend(_fix_llm_values_first_ebitda_rows(pnl_rows, pnl_columns))
+    warnings.extend(_remove_insurance_manufacturing_metrics(pnl_rows))
     warnings.extend(_reorder_llm_values_first_pnl_rows(pnl_rows))
     warnings.extend(_fix_llm_values_first_balance_sheet_totals(bs_cf_rows, bs_cf_columns))
     warnings.extend(_remove_noisy_llm_segment_rows(segment_rows, segment_columns))
     return _dedupe(warnings)
+
+
+def _remove_insurance_manufacturing_metrics(rows: list[dict[str, Any]]) -> list[str]:
+    """Do not render generic Gross Profit/EBITDA formulas for insurance statements."""
+
+    evidence = " ".join(
+        f"{row.get('label', '')} {row.get('source_note', '')}".lower()
+        for row in rows
+        if isinstance(row, dict)
+    )
+    if "premium earned" not in evidence or "claims paid" not in evidence:
+        return []
+    blocked = {"grossprofit", "grossprofitmargin", "ebitda", "ebitdamargin"}
+    before = len(rows)
+    rows[:] = [row for row in rows if _llm_row_key(str(row.get("label") or "")) not in blocked]
+    removed = before - len(rows)
+    return [f"llm_values_first_insurance_manufacturing_metrics_removed:{removed}"] if removed else []
+
+
+def _remove_segment_proxy_balance_sheet_rows(rows: list[dict[str, Any]]) -> list[str]:
+    """Reject segment assets/liabilities copied into the statutory Balance Sheet section."""
+
+    def is_proxy(row: dict[str, Any]) -> bool:
+        text = f"{row.get('label', '')} {row.get('source_note', '')} {row.get('evidence', '')}".lower()
+        return "proxy from segment" in text or "segment total" in text or "capital employed (segment" in text
+
+    before = len(rows)
+    rows[:] = [row for row in rows if not is_proxy(row)]
+    if rows and all(row.get("type") == "section" for row in rows):
+        rows.clear()
+    removed = before - len(rows)
+    return [f"llm_values_first_segment_proxy_bs_rows_removed:{removed}"] if removed else []
 
 
 def _preserve_llm_dash_blank_cells(rows: list[dict[str, Any]]) -> list[str]:
@@ -2053,6 +2125,7 @@ def _ensure_llm_total_income_component_rows(rows: list[dict[str, Any]], columns:
 def _fix_llm_values_first_gross_profit_rows(rows: list[dict[str, Any]], columns: list[dict[str, str]]) -> list[str]:
     revenue = _find_first_row(rows, _is_revenue_row_key)
     gross = _find_first_row(rows, lambda key: key == "grossprofit")
+    gross_margin = _find_first_row(rows, lambda key: key in {"grossprofitmargin", "grossprofitmarginpercent"})
     if not (revenue and gross):
         return []
     component_rows = _gross_profit_component_rows(rows)
@@ -2085,6 +2158,12 @@ def _fix_llm_values_first_gross_profit_rows(rows: list[dict[str, Any]], columns:
         if current is None or abs(current - expected) > 0.05:
             _set_row_value(gross, period, expected)
             warnings.append(f"llm_values_first_gross_profit_consistency_adjusted:{period}")
+        if gross_margin and revenue_value != 0:
+            expected_margin = expected / revenue_value * 100
+            current_margin = _row_number(gross_margin, period)
+            if current_margin is None or abs(current_margin - expected_margin) > 0.1:
+                _set_row_value(gross_margin, period, expected_margin, percent=True)
+                warnings.append(f"llm_values_first_gross_profit_margin_consistency_adjusted:{period}")
     return warnings
 
 
@@ -2184,6 +2263,14 @@ def _gross_profit_component_rows(rows: list[dict[str, Any]]) -> list[dict[str, A
         "changesininventories",
         "changeininventories",
         "inventorychange",
+        "projectexecution",
+        "projectexpense",
+        "siteexecution",
+        "contractexecution",
+        "constructionexpense",
+        "constructioncost",
+        "landdevelopment",
+        "developmentandconstruction",
     )
     for row in rows:
         if not isinstance(row, dict) or row.get("type") == "section":
@@ -3528,6 +3615,10 @@ def _call_responses_api(
         "instructions": instructions,
         "input": input_text,
     }
+    background_mode = _truthy_env("GPT54_BACKGROUND_MODE", True)
+    if background_mode:
+        payload["background"] = True
+        payload["store"] = True
     max_output_tokens = (
         os.environ.get("GPT54_MAX_OUTPUT_TOKENS")
         or os.environ.get("MAX_OUTPUT_TOKENS")
@@ -3537,7 +3628,7 @@ def _call_responses_api(
         payload["max_output_tokens"] = max(1, int(max_output_tokens))
     except ValueError:
         payload["max_output_tokens"] = GPT54_MAX_OUTPUT_TOKENS_DEFAULT
-        logging.warning("Ignoring invalid GPT54_MAX_OUTPUT_TOKENS value; using 128000.")
+        logging.warning("Ignoring invalid GPT54_MAX_OUTPUT_TOKENS value; using 48000.")
     reasoning_effort_requested = _configured_reasoning_effort()
     reasoning_effort_used = reasoning_effort_requested
     xhigh_supported: bool | None = True if reasoning_effort_requested == "xhigh" else False
@@ -3553,8 +3644,40 @@ def _call_responses_api(
             }
         }
 
-    timeout = float(os.environ.get("GPT54_TIMEOUT_SECONDS", "900"))
-    retries = max(1, min(5, int(os.environ.get("GPT54_HTTP_RETRIES", "3"))))
+    timeout = float(
+        os.environ.get("GPT54_ACTIVE_TIMEOUT_SECONDS")
+        or os.environ.get("GPT54_TIMEOUT_SECONDS", "1800")
+    )
+    retries = max(1, min(5, int(os.environ.get("GPT54_HTTP_RETRIES", "1"))))
+    logging.info(
+        "GPT54 request profile model=%s reasoning=%s timeout_seconds=%s max_output_tokens=%s configured_http_attempts=%s",
+        model_name,
+        reasoning_effort_requested,
+        timeout,
+        payload.get("max_output_tokens"),
+        retries,
+    )
+    resume_response_id = os.environ.pop("GPT54_RESUME_RESPONSE_ID_ONCE", "").strip()
+    if resume_response_id:
+        logging.info("GPT54 resuming stored background response response_id=%s", resume_response_id)
+        result = _poll_background_response(
+            url,
+            resume_response_id,
+            headers=headers,
+            wall_timeout_seconds=timeout,
+        )
+        result["_routing_metadata"] = {
+            "model_used": model_name,
+            "reasoning_effort_requested": reasoning_effort_requested,
+            "reasoning_effort_used": reasoning_effort_used,
+            "xhigh_supported": bool(xhigh_supported),
+            "fallback_reason": "resumed_stored_response",
+            "timeout_seconds": timeout,
+            "max_output_tokens": payload.get("max_output_tokens"),
+            "configured_http_attempts": 0,
+            "background_mode": True,
+        }
+        return result
     last_error = ""
     xhigh_retry_used = False
     for attempt in range(retries):
@@ -3568,6 +3691,23 @@ def _call_responses_api(
             break
         if response.status_code < 400:
             result = response.json()
+            if (
+                background_mode
+                and isinstance(result, dict)
+                and str(result.get("status") or "").lower() in {"queued", "in_progress"}
+                and result.get("id")
+            ):
+                logging.info(
+                    "GPT54 background response created response_id=%s status=%s",
+                    result.get("id"),
+                    result.get("status"),
+                )
+                result = _poll_background_response(
+                    url,
+                    str(result["id"]),
+                    headers=headers,
+                    wall_timeout_seconds=timeout,
+                )
             if isinstance(result, dict):
                 result["_routing_metadata"] = {
                     "model_used": model_name,
@@ -3575,6 +3715,10 @@ def _call_responses_api(
                     "reasoning_effort_used": reasoning_effort_used,
                     "xhigh_supported": bool(xhigh_supported),
                     "fallback_reason": fallback_reason,
+                    "timeout_seconds": timeout,
+                    "max_output_tokens": payload.get("max_output_tokens"),
+                    "configured_http_attempts": retries,
+                    "background_mode": background_mode,
                 }
             return result
         last_error = _redacted_http_error(response)
@@ -3607,6 +3751,58 @@ def _call_responses_api(
     raise RuntimeError(last_error or "GPT-5.4 Responses API request failed.")
 
 
+def _poll_background_response(
+    responses_url: str,
+    response_id: str,
+    *,
+    headers: dict[str, str],
+    wall_timeout_seconds: float,
+) -> dict[str, Any]:
+    """Poll one stored response ID with an absolute deadline and no duplicate create call."""
+
+    poll_url = f"{responses_url.rstrip('/')}/{response_id}"
+    interval = max(0.0, float(os.environ.get("GPT54_BACKGROUND_POLL_SECONDS", "5")))
+    deadline = time.monotonic() + max(1.0, float(wall_timeout_seconds))
+    last_error = ""
+    poll_count = 0
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise RuntimeError(
+                f"GPT-5.4 background response exceeded {wall_timeout_seconds:g} seconds "
+                f"response_id={response_id} polls={poll_count}."
+            )
+        if interval:
+            time.sleep(min(interval, remaining))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            continue
+        poll_count += 1
+        try:
+            response = httpx.get(
+                poll_url,
+                headers=headers,
+                timeout=max(1.0, min(30.0, remaining)),
+            )
+        except httpx.RequestError as exc:
+            last_error = _redact(f"GPT-5.4 background poll transport error: {exc}")
+            logging.warning("%s response_id=%s poll=%s", last_error, response_id, poll_count)
+            continue
+        if response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+            last_error = _redacted_http_error(response)
+            logging.warning("GPT-5.4 background poll transient failure: %s response_id=%s poll=%s", last_error, response_id, poll_count)
+            continue
+        if response.status_code >= 400:
+            raise RuntimeError(_redacted_http_error(response))
+        result = response.json()
+        if not isinstance(result, dict):
+            raise RuntimeError("GPT-5.4 background poll returned a non-object response.")
+        status = str(result.get("status") or "").strip().lower()
+        logging.info("GPT54 background poll response_id=%s poll=%s status=%s", response_id, poll_count, status or "unknown")
+        if status not in {"queued", "in_progress"}:
+            return result
+
+
 def _response_execution_metadata(
     response: dict[str, Any],
     *,
@@ -3636,6 +3832,10 @@ def _response_execution_metadata(
         "reasoning_effort_used": reasoning_used,
         "xhigh_supported": bool(routing_metadata.get("xhigh_supported")),
         "fallback_reason": str(routing_metadata.get("fallback_reason") or ""),
+        "timeout_seconds": routing_metadata.get("timeout_seconds"),
+        "max_output_tokens": routing_metadata.get("max_output_tokens"),
+        "configured_http_attempts": routing_metadata.get("configured_http_attempts"),
+        "background_mode": bool(routing_metadata.get("background_mode")),
         "response_text_chars": len(response_text or ""),
         "output_item_count": len(output_items) if isinstance(output_items, list) else 0,
         "usage": {

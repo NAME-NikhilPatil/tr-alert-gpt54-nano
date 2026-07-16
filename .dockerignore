@@ -30,3 +30,17 @@ screenshots/
 *.xlsx
 *.xls
 *.csv
+*.jpg
+*.jpeg
+*.png
+
+AGENTS.md
+codex_history.txt
+SESSION_BACKUP_*.md
+SNAPSHOT_INFO.txt
+telegram_offset.json
+telegram_subscribers.json
+test_*.py
+verify_*.py
+audit_*.py
+run_*acceptance.py

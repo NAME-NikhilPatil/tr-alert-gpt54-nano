@@ -129,7 +129,7 @@ class TelegramSender:
             result = payload.get("result", [])
             return result if isinstance(result, list) else []
         except Exception as exc:
-            logging.warning("Telegram getUpdates failed: %s", exc)
+            logging.warning("Telegram getUpdates failed: %s", _redact_telegram_error(exc, self.bot_token))
             return []
 
     def drain_queue(self) -> int:
@@ -202,7 +202,7 @@ class TelegramSender:
                     return True
                 logging.warning("Telegram document send failed HTTP %s for chat %s: %s", response.status_code, chat_id, response.text[:300])
             except Exception as exc:
-                logging.warning("Telegram document send attempt %s failed for chat %s: %s", attempt, chat_id, exc)
+                logging.warning("Telegram document send attempt %s failed for chat %s: %s", attempt, chat_id, _redact_telegram_error(exc, self.bot_token))
             time.sleep(5)
         return False
 
@@ -231,7 +231,7 @@ class TelegramSender:
                     return True
                 logging.warning("Telegram photo send failed HTTP %s for chat %s: %s", response.status_code, chat_id, response.text[:300])
             except Exception as exc:
-                logging.warning("Telegram photo send attempt %s failed for chat %s: %s", attempt, chat_id, exc)
+                logging.warning("Telegram photo send attempt %s failed for chat %s: %s", attempt, chat_id, _redact_telegram_error(exc, self.bot_token))
             time.sleep(5)
         return False
 
@@ -253,7 +253,7 @@ class TelegramSender:
                     return True
                 logging.warning("Telegram %s failed HTTP %s: %s", method, response.status_code, response.text[:300])
             except Exception as exc:
-                logging.warning("Telegram %s attempt %s failed: %s", method, attempt, exc)
+                logging.warning("Telegram %s attempt %s failed: %s", method, attempt, _redact_telegram_error(exc, self.bot_token))
             time.sleep(5)
         return False
 
@@ -263,3 +263,13 @@ class TelegramSender:
         with QUEUE_LOCK:
             with QUEUE_PATH.open("a", encoding="utf-8") as handle:
                 handle.write(json.dumps(payload) + "\n")
+
+
+def _redact_telegram_error(error: object, bot_token: str) -> str:
+    """Prevent the bot credential embedded in Telegram URLs from reaching logs."""
+
+    text = str(error or "")
+    token = str(bot_token or "")
+    if token:
+        text = text.replace(token, "[redacted-bot-token]")
+    return text

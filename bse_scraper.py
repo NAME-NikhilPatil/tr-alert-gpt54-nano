@@ -16,7 +16,7 @@ from stealth import apply_stealth
 from utils import BSE_BASE_URL, BSE_HEADERS, absolutize_url, exchange_date, request_with_retries
 
 BSE_ANNOUNCEMENTS_URL = "https://www.bseindia.com/corporates/ann"
-BSE_API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnGetData/w"
+BSE_API_URL = "https://api.bseindia.com/BseIndiaAPI/api/AnnSubCategoryGetData/w"
 
 
 async def fetch_bse_announcements(run_date: date, scrip_code: str | None = None) -> list[Announcement]:
@@ -42,7 +42,7 @@ async def _fetch_bse_via_api(run_date: date, scrip_code: str | None = None) -> l
             empty_pages = 0
             seen_page_signatures: set[tuple[str, ...]] = set()
             for page_no in range(1, 45):
-                params = {**base_params, "page_no": str(page_no)}
+                params = {**base_params, "pageno": str(page_no)}
                 response = await request_with_retries(client, "GET", BSE_API_URL, params=params, headers=BSE_HEADERS)
                 payload = response.json()
                 rows = _extract_bse_rows(payload)
@@ -83,7 +83,7 @@ def _bse_api_param_sets(run_date: date, scrip_code: str | None = None) -> list[d
     compact_date = run_date.strftime("%Y%m%d")
     slash_date = exchange_date(run_date, "/")
     common = {
-        "strScrip": scrip_code or "",
+        "strscrip": scrip_code or "",
         "strSearch": "P",
         "strType": "C",
     }
@@ -136,7 +136,7 @@ async def _fetch_bse_via_browser(run_date: date) -> list[Announcement]:
         async def capture_response(response: Any) -> None:
             """Capture BSE announcement JSON responses emitted by the page."""
 
-            if "AnnGetData" not in response.url:
+            if not _is_bse_announcement_response_url(response.url):
                 return
             try:
                 payload = await response.json()
@@ -158,6 +158,13 @@ async def _fetch_bse_via_browser(run_date: date) -> list[Announcement]:
         browser_announcements = await _parse_bse_dom_rows(page)
         await browser.close()
         return _dedupe_announcements(browser_announcements)
+
+
+def _is_bse_announcement_response_url(url: str) -> bool:
+    """Return whether a browser response is from a known BSE announcement API."""
+
+    lowered = str(url or "").lower()
+    return "annsubcategorygetdata" in lowered or "anngetdata" in lowered
 
 
 async def _bse_apply_filters(page: Any, run_date: date) -> None:

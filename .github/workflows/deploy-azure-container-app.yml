@@ -41,8 +41,11 @@ jobs:
             gpt54_extractor.py financial_pipeline.py financial_validation.py \
             image_generator.py pl_image.py bs_cf_image.py segment_image.py
 
-      - name: Run NSE discovery regression tests
-        run: python -B test_nse_scraper.py
+      - name: Run NSE and BSE discovery regression tests
+        run: python -m unittest test_bse_scraper.py test_nse_scraper.py
+
+      - name: Run PDF queue concurrency tests
+        run: python -B test_pdf_job_concurrency.py
 
       - name: Run financial pipeline guard tests
         run: python -B test_financial_image_guards.py
@@ -117,6 +120,33 @@ jobs:
             --username "${{ secrets.AZURE_REGISTRY_USERNAME }}" \
             --password "${{ secrets.AZURE_REGISTRY_PASSWORD }}"
 
+      - name: Verify persistent runtime storage mount
+        shell: bash
+        run: |
+          mount_volume=$(az containerapp show \
+            --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --query "properties.template.containers[0].volumeMounts[?mountPath=='/data'].volumeName | [0]" \
+            --output tsv)
+
+          if [[ -z "$mount_volume" ]]; then
+            echo "::error::Container App must mount persistent Azure Files storage at /data before deployment."
+            exit 1
+          fi
+
+          storage_name=$(az containerapp show \
+            --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+            --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+            --query "properties.template.volumes[?name=='${mount_volume}' && storageType=='AzureFile'].storageName | [0]" \
+            --output tsv)
+
+          if [[ -z "$storage_name" ]]; then
+            echo "::error::The /data volume must use persistent AzureFile storage, not ephemeral EmptyDir storage."
+            exit 1
+          fi
+
+          echo "Persistent runtime storage verified: volume=$mount_volume storage=$storage_name mount=/data"
+
       - name: Deploy a new Azure Container Apps revision
         id: deploy
         shell: bash
@@ -129,9 +159,24 @@ jobs:
             --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
             --image "$image" \
             --revision-suffix "$revision_suffix" \
+            --min-replicas 1 \
+            --max-replicas 1 \
             --set-env-vars \
               "APP_VERSION=${GITHUB_SHA}" \
-              "GPT54_HTTP_RETRIES=3"
+              "TR_ALERT_DATA_DIR=/data" \
+              "MAX_CONCURRENT_PDF_JOBS=1" \
+              "PDF_JOB_RETRY_LIMIT=1" \
+              "GPT54_TIMEOUT_SECONDS=1800" \
+              "GPT54_COMPLEX_TIMEOUT_SECONDS=2700" \
+              "GPT_REQUEST_TIMEOUT_SECONDS=1800" \
+              "GPT54_HTTP_RETRIES=1" \
+              "GPT54_BACKGROUND_MODE=true" \
+              "GPT54_BACKGROUND_POLL_SECONDS=5" \
+              "GPT54_MAX_OUTPUT_TOKENS=48000" \
+              "GPT54_DEFAULT_REASONING_EFFORT=high" \
+              "GPT54_COMPLEX_REASONING_EFFORT=high" \
+              "GPT54_USE_XHIGH_FOR_COMPLEX=false" \
+              "GPT54_RETRY_XHIGH_ON_VALUES_FIRST_WARNINGS=false"
 
           revision_name=$(az containerapp show \
             --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
