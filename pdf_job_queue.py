@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
@@ -12,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from db_manager import DB_PATH
+from db_manager import _db_connection as _shared_db_connection
 from db_manager import init_seen_db
 from models import Announcement
 
@@ -27,18 +27,11 @@ ACTIVE_OR_COMPLETED_STATUSES = {QUEUED, PROCESSING, DONE, SKIPPED_NON_FINANCIAL_
 
 
 @contextmanager
-def _db_connection(db_path: Path, *, timeout: float = 5.0) -> Any:
-    """Open a SQLite connection and always close it on Windows."""
+def _db_connection(db_path: Path, *, timeout: float | None = None) -> Any:
+    """Reuse the tracker database's lock-tolerant connection policy."""
 
-    connection = sqlite3.connect(db_path, timeout=timeout)
-    try:
+    with _shared_db_connection(db_path, timeout=timeout) as connection:
         yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
 
 
 @dataclass(slots=True)

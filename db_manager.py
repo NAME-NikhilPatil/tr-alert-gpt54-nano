@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import sqlite3
+import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -10,13 +14,38 @@ from typing import Any
 from models import Announcement
 
 DB_PATH = Path("seen_announcements.db")
+_INITIALIZED_DB_PATHS: set[str] = set()
+_DB_INIT_LOCK = threading.RLock()
+
+
+def _positive_float_env(name: str, default: float) -> float:
+    """Return a positive finite timeout from the environment."""
+
+    try:
+        value = float(os.environ.get(name, str(default)))
+    except (TypeError, ValueError):
+        return default
+    return value if 0 < value < 86_400 else default
+
+
+def _database_key(db_path: Path) -> str:
+    """Resolve a relative database path after the runtime data-dir chdir."""
+
+    return str(db_path.expanduser().resolve())
+
+
+def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return "locked" in message or "busy" in message
 
 
 @contextmanager
-def _db_connection(db_path: Path) -> Any:
-    """Open a SQLite connection and always close it on Windows."""
+def _db_connection(db_path: Path, *, timeout: float | None = None) -> Any:
+    """Open a lock-tolerant SQLite connection and always close it."""
 
-    connection = sqlite3.connect(db_path)
+    effective_timeout = timeout or _positive_float_env("SQLITE_BUSY_TIMEOUT_SECONDS", 30.0)
+    connection = sqlite3.connect(db_path, timeout=effective_timeout)
+    connection.execute(f"PRAGMA busy_timeout = {max(1, int(effective_timeout * 1000))}")
     try:
         yield connection
         connection.commit()
@@ -28,45 +57,81 @@ def _db_connection(db_path: Path) -> Any:
 
 
 def init_seen_db(db_path: Path = DB_PATH) -> None:
-    """Create the live tracker database tables if they do not exist."""
+    """Create tracker tables once, retrying transient rollout locks."""
 
-    with _db_connection(db_path) as connection:
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS seen_pdfs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                source TEXT NOT NULL,
-                company_name TEXT,
-                announcement_id TEXT UNIQUE NOT NULL,
-                pdf_url TEXT,
-                downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                processed INTEGER DEFAULT 0
+    db_key = _database_key(db_path)
+    with _DB_INIT_LOCK:
+        if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
+            return
+        _INITIALIZED_DB_PATHS.discard(db_key)
+
+        retry_window = _positive_float_env("SQLITE_INIT_RETRY_SECONDS", 300.0)
+        base_delay = _positive_float_env("SQLITE_INIT_RETRY_DELAY_SECONDS", 0.5)
+        deadline = time.monotonic() + retry_window
+        attempt = 0
+        while True:
+            attempt += 1
+            remaining = max(0.0, deadline - time.monotonic())
+            busy_timeout = min(
+                _positive_float_env("SQLITE_BUSY_TIMEOUT_SECONDS", 30.0),
+                max(0.05, remaining),
             )
-            """
-        )
-        connection.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_seen_pdfs_pdf_url ON seen_pdfs(pdf_url)")
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS telegram_subscribers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id TEXT UNIQUE NOT NULL,
-                username TEXT,
-                first_name TEXT,
-                last_name TEXT,
-                subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                active INTEGER DEFAULT 1
-            )
-            """
-        )
-        connection.execute(
-            """
-            CREATE TABLE IF NOT EXISTS telegram_state (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-            """
-        )
+            try:
+                with _db_connection(db_path, timeout=busy_timeout) as connection:
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS seen_pdfs (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            source TEXT NOT NULL,
+                            company_name TEXT,
+                            announcement_id TEXT UNIQUE NOT NULL,
+                            pdf_url TEXT,
+                            downloaded_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            processed INTEGER DEFAULT 0
+                        )
+                        """
+                    )
+                    connection.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_seen_pdfs_pdf_url ON seen_pdfs(pdf_url)"
+                    )
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS telegram_subscribers (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            chat_id TEXT UNIQUE NOT NULL,
+                            username TEXT,
+                            first_name TEXT,
+                            last_name TEXT,
+                            subscribed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            active INTEGER DEFAULT 1
+                        )
+                        """
+                    )
+                    connection.execute(
+                        """
+                        CREATE TABLE IF NOT EXISTS telegram_state (
+                            key TEXT PRIMARY KEY,
+                            value TEXT
+                        )
+                        """
+                    )
+                _INITIALIZED_DB_PATHS.add(db_key)
+                if attempt > 1:
+                    logging.info("SQLite tracker initialization acquired the database lock after %s attempts.", attempt)
+                return
+            except sqlite3.OperationalError as exc:
+                remaining = deadline - time.monotonic()
+                if not _is_lock_error(exc) or remaining <= 0:
+                    raise
+                delay = min(base_delay * (2 ** min(attempt - 1, 4)), 5.0, remaining)
+                logging.warning(
+                    "SQLite tracker database is temporarily locked during startup; retrying in %.2fs "
+                    "(attempt %s).",
+                    delay,
+                    attempt,
+                )
+                time.sleep(delay)
 
 
 def seed_telegram_subscribers(chat_ids: str | list[str], db_path: Path = DB_PATH) -> int:

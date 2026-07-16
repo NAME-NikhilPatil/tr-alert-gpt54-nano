@@ -37,7 +37,7 @@ jobs:
       - name: Compile production modules
         run: |
           python -m py_compile \
-            main.py nse_scraper.py bse_scraper.py utils.py \
+            main.py nse_scraper.py bse_scraper.py utils.py db_manager.py pdf_job_queue.py \
             gpt54_extractor.py financial_pipeline.py financial_validation.py \
             image_generator.py pl_image.py bs_cf_image.py segment_image.py
 
@@ -45,7 +45,9 @@ jobs:
         run: python -m unittest test_bse_scraper.py test_nse_scraper.py
 
       - name: Run PDF queue concurrency tests
-        run: python -B test_pdf_job_concurrency.py
+        run: |
+          python -B test_db_manager_locking.py
+          python -B test_pdf_job_concurrency.py
 
       - name: Run financial pipeline guard tests
         run: python -B test_financial_image_guards.py
@@ -256,6 +258,9 @@ jobs:
             --set-env-vars \
               "APP_VERSION=${GITHUB_SHA}" \
               "TR_ALERT_DATA_DIR=/data" \
+              "SQLITE_BUSY_TIMEOUT_SECONDS=30" \
+              "SQLITE_INIT_RETRY_SECONDS=300" \
+              "SQLITE_INIT_RETRY_DELAY_SECONDS=0.5" \
               "MAX_CONCURRENT_PDF_JOBS=1" \
               "PDF_JOB_RETRY_LIMIT=1" \
               "GPT54_TIMEOUT_SECONDS=1800" \
@@ -319,5 +324,63 @@ jobs:
             echo "::error::Revision image mismatch: expected $expected_image, got $deployed_image"
             exit 1
           fi
+
+          echo "Observing the deployed worker replica for 60 seconds before declaring success."
+          stable_checks=0
+          for attempt in {1..12}; do
+            sleep 5
+            replica_count=$(az containerapp revision show \
+              --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --revision "$revision" \
+              --query properties.replicas \
+              --output tsv)
+            container_ready=$(az containerapp replica list \
+              --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --revision "$revision" \
+              --query '[0].properties.containers[0].ready' \
+              --output tsv)
+            container_started=$(az containerapp replica list \
+              --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --revision "$revision" \
+              --query '[0].properties.containers[0].started' \
+              --output tsv)
+            container_state=$(az containerapp replica list \
+              --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --revision "$revision" \
+              --query '[0].properties.containers[0].runningState' \
+              --output tsv)
+            restart_count=$(az containerapp replica list \
+              --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --revision "$revision" \
+              --query '[0].properties.containers[0].restartCount' \
+              --output tsv)
+
+            echo "Replica stability check $attempt/12: replicas=${replica_count:-0} ready=${container_ready:-false} started=${container_started:-false} state=${container_state:-unknown} restarts=${restart_count:-unknown}"
+            if [[ "$replica_count" == "1" && "${container_ready,,}" == "true" && "${container_started,,}" == "true" && "${container_state,,}" == "running" && "$restart_count" == "0" ]]; then
+              stable_checks=$((stable_checks + 1))
+              continue
+            fi
+
+            echo "::error::The deployed worker did not remain healthy. Replica readiness or restart count changed during the stability window."
+            az containerapp logs show \
+              --name "${{ secrets.AZURE_CONTAINER_APP_NAME }}" \
+              --resource-group "${{ secrets.AZURE_RESOURCE_GROUP }}" \
+              --revision "$revision" \
+              --type console \
+              --tail 100 \
+              --format text || true
+            exit 1
+          done
+
+          if [[ "$stable_checks" != "12" ]]; then
+            echo "::error::The deployed worker did not pass the full stability window."
+            exit 1
+          fi
+          echo "Deployment verified: worker replica remained ready with zero restarts for 60 seconds."
 
           echo "Azure revision $revision is running image $deployed_image"
