@@ -226,7 +226,7 @@ async def _parse_bse_dom_rows(page: Any) -> list[Announcement]:
             text = await row.inner_text()
         except Exception:
             continue
-        if "Outcome of Board Meeting" not in text:
+        if not _is_bse_board_meeting_outcome(text):
             continue
         pdf_url = ""
         pdf_link = row.locator("a[href*='.pdf'], a:has-text('PDF')").first
@@ -279,7 +279,7 @@ def _bse_row_to_announcement(row: dict[str, Any]) -> Announcement | None:
     title = _first_value(row, "NEWSSUB", "News_Sub", "HEADLINE", "SLONGNAME", "SUBJECT")
     details = _strip_html(_first_value(row, "MORE", "NEWSBODY", "TEXT", "DETAILS"))
     combined = f"{title} {details}"
-    if "outcome of board meeting" not in combined.lower():
+    if not _is_bse_board_meeting_outcome(combined):
         return None
     scrip_code = _first_value(row, "SCRIP_CD", "SCRIPCODE", "CODE", "scrip_cd")
     company = _first_value(row, "SLONGNAME", "CompanyName", "COMPANY_NAME", "company")
@@ -323,9 +323,19 @@ def compact_bse_title(text: str) -> str:
 
     for line in (text or "").splitlines():
         cleaned = line.strip()
-        if "Outcome of Board Meeting" in cleaned:
+        if _is_bse_board_meeting_outcome(cleaned):
             return cleaned
     return (text or "").splitlines()[0].strip() if text else ""
+
+
+def _is_bse_board_meeting_outcome(text: str) -> bool:
+    """Recognize both legacy and current BSE board-outcome subject wording."""
+
+    normalized = re.sub(r"[^a-z0-9]+", " ", str(text or "").lower()).strip()
+    return (
+        "outcome of board meeting" in normalized
+        or "board meeting outcome" in normalized
+    )
 
 
 def split_bse_company_code(title: str) -> tuple[str, str]:
