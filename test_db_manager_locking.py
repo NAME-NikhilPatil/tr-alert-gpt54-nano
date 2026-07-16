@@ -10,9 +10,62 @@ from pathlib import Path
 from unittest.mock import patch
 
 import db_manager
+from models import Announcement
 
 
 class DbManagerLockingTests(unittest.TestCase):
+    def test_local_database_can_migrate_the_legacy_azure_files_database(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            legacy_path = root / "azure-files" / "seen_announcements.db"
+            local_path = root / "local" / "seen_announcements.db"
+            snapshot_dir = root / "snapshots"
+            announcement = Announcement(
+                source="BSE",
+                company_name="Legacy State Limited",
+                identifier="LEGACY",
+                announcement_datetime="2026-07-16T06:01:00",
+                subject="Outcome of Board Meeting",
+                pdf_url="https://example.test/legacy.pdf",
+            )
+            db_manager.reserve_seen(announcement, legacy_path)
+
+            env = {
+                "TR_ALERT_DB_SNAPSHOT_DIR": str(snapshot_dir),
+                "TR_ALERT_DB_LEGACY_PATH": str(legacy_path),
+            }
+            with patch.dict(os.environ, env, clear=False):
+                self.assertTrue(db_manager.is_seen(announcement, local_path))
+                self.assertTrue(local_path.exists())
+                self.assertTrue(list(snapshot_dir.glob("*.sqlite3")))
+
+    def test_local_database_is_restored_from_persistent_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            db_path = root / "local" / "seen.db"
+            snapshot_dir = root / "persistent-snapshots"
+            announcement = Announcement(
+                source="NSE",
+                company_name="Snapshot Test Limited",
+                identifier="SNAPSHOT",
+                announcement_datetime="2026-07-16T06:00:00",
+                subject="Outcome of Board Meeting",
+                pdf_url="https://example.test/snapshot.pdf",
+            )
+            env = {
+                "TR_ALERT_DB_SNAPSHOT_DIR": str(snapshot_dir),
+                "TR_ALERT_DB_LEGACY_PATH": "",
+                "TR_ALERT_DB_SNAPSHOT_KEEP": "5",
+            }
+            with patch.dict(os.environ, env, clear=False):
+                db_manager.reserve_seen(announcement, db_path)
+                snapshots = list(snapshot_dir.glob("*.sqlite3"))
+                self.assertTrue(snapshots)
+
+                db_path.unlink()
+                self.assertTrue(db_manager.is_seen(announcement, db_path))
+                self.assertTrue(db_path.exists())
+
     def test_init_retries_a_transient_database_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "seen.db"

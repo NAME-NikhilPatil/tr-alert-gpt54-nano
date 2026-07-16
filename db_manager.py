@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import os
+import re
+import shutil
 import sqlite3
 import threading
 import time
@@ -13,9 +15,10 @@ from typing import Any
 
 from models import Announcement
 
-DB_PATH = Path("seen_announcements.db")
+DB_PATH = Path(os.environ.get("TR_ALERT_DB_PATH", "").strip() or "seen_announcements.db")
 _INITIALIZED_DB_PATHS: set[str] = set()
 _DB_INIT_LOCK = threading.RLock()
+_DB_OPERATION_LOCK = threading.RLock()
 
 
 def _positive_float_env(name: str, default: float) -> float:
@@ -39,21 +42,114 @@ def _is_lock_error(exc: sqlite3.OperationalError) -> bool:
     return "locked" in message or "busy" in message
 
 
+def _snapshot_directory() -> Path | None:
+    configured = os.environ.get("TR_ALERT_DB_SNAPSHOT_DIR", "").strip()
+    return Path(configured).expanduser() if configured else None
+
+
+def _snapshot_prefix(db_path: Path) -> str:
+    return re.sub(r"[^A-Za-z0-9_.-]+", "-", db_path.name).strip("-.") or "tracker"
+
+
+def _snapshot_candidates(db_path: Path) -> list[Path]:
+    snapshot_dir = _snapshot_directory()
+    if snapshot_dir is None or not snapshot_dir.exists():
+        return []
+    prefix = _snapshot_prefix(db_path)
+    return sorted(snapshot_dir.glob(f"{prefix}-*.sqlite3"), reverse=True)
+
+
+def _sqlite_quick_check(db_path: Path) -> bool:
+    connection = sqlite3.connect(db_path, timeout=5.0)
+    try:
+        row = connection.execute("PRAGMA quick_check").fetchone()
+        return bool(row and str(row[0]).lower() == "ok")
+    finally:
+        connection.close()
+
+
+def _restore_database_snapshot(db_path: Path) -> Path | None:
+    """Restore the newest valid snapshot into local container storage."""
+
+    if db_path.exists():
+        return None
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    candidates = _snapshot_candidates(db_path)
+    legacy_path = os.environ.get("TR_ALERT_DB_LEGACY_PATH", "").strip()
+    if legacy_path:
+        legacy = Path(legacy_path).expanduser()
+        if legacy.exists():
+            candidates.append(legacy)
+
+    restore_temp = db_path.with_name(f".{db_path.name}.restore-{os.getpid()}.tmp")
+    for source in candidates:
+        try:
+            shutil.copyfile(source, restore_temp)
+            if not _sqlite_quick_check(restore_temp):
+                logging.error("Ignoring invalid SQLite state snapshot: %s", source)
+                restore_temp.unlink(missing_ok=True)
+                continue
+            os.replace(restore_temp, db_path)
+            logging.info("Restored SQLite tracker state from %s", source)
+            return source
+        except (OSError, sqlite3.DatabaseError):
+            logging.exception("Unable to restore SQLite tracker state from %s", source)
+            restore_temp.unlink(missing_ok=True)
+    return None
+
+
+def _snapshot_database(db_path: Path) -> Path | None:
+    """Persist a closed local SQLite database as an immutable Azure Files snapshot."""
+
+    snapshot_dir = _snapshot_directory()
+    if snapshot_dir is None or not db_path.exists():
+        return None
+    try:
+        if not _sqlite_quick_check(db_path):
+            logging.error("SQLite tracker quick_check failed; persistent snapshot was not written.")
+            return None
+        snapshot_dir.mkdir(parents=True, exist_ok=True)
+        prefix = _snapshot_prefix(db_path)
+        stamp = time.time_ns()
+        final_path = snapshot_dir / f"{prefix}-{stamp:020d}.sqlite3"
+        staging_path = snapshot_dir / f".{prefix}-{stamp:020d}-{os.getpid()}.tmp"
+        shutil.copyfile(db_path, staging_path)
+        os.replace(staging_path, final_path)
+
+        try:
+            keep_count = max(2, min(100, int(os.environ.get("TR_ALERT_DB_SNAPSHOT_KEEP", "20"))))
+        except ValueError:
+            keep_count = 20
+        for old_snapshot in _snapshot_candidates(db_path)[keep_count:]:
+            old_snapshot.unlink(missing_ok=True)
+        return final_path
+    except OSError:
+        logging.exception("Unable to persist SQLite tracker snapshot to %s", snapshot_dir)
+        return None
+
+
 @contextmanager
 def _db_connection(db_path: Path, *, timeout: float | None = None) -> Any:
     """Open a lock-tolerant SQLite connection and always close it."""
 
-    effective_timeout = timeout or _positive_float_env("SQLITE_BUSY_TIMEOUT_SECONDS", 30.0)
-    connection = sqlite3.connect(db_path, timeout=effective_timeout)
-    connection.execute(f"PRAGMA busy_timeout = {max(1, int(effective_timeout * 1000))}")
-    try:
-        yield connection
-        connection.commit()
-    except Exception:
-        connection.rollback()
-        raise
-    finally:
-        connection.close()
+    with _DB_OPERATION_LOCK:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        effective_timeout = timeout or _positive_float_env("SQLITE_BUSY_TIMEOUT_SECONDS", 30.0)
+        connection = sqlite3.connect(db_path, timeout=effective_timeout)
+        connection.execute(f"PRAGMA busy_timeout = {max(1, int(effective_timeout * 1000))}")
+        changes_before = connection.total_changes
+        committed_changes = False
+        try:
+            yield connection
+            connection.commit()
+            committed_changes = connection.total_changes > changes_before
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+        if committed_changes:
+            _snapshot_database(db_path)
 
 
 def init_seen_db(db_path: Path = DB_PATH) -> None:
@@ -61,6 +157,7 @@ def init_seen_db(db_path: Path = DB_PATH) -> None:
 
     db_key = _database_key(db_path)
     with _DB_INIT_LOCK:
+        _restore_database_snapshot(db_path)
         if db_key in _INITIALIZED_DB_PATHS and db_path.exists():
             return
         _INITIALIZED_DB_PATHS.discard(db_key)
@@ -117,6 +214,7 @@ def init_seen_db(db_path: Path = DB_PATH) -> None:
                         """
                     )
                 _INITIALIZED_DB_PATHS.add(db_key)
+                _snapshot_database(db_path)
                 if attempt > 1:
                     logging.info("SQLite tracker initialization acquired the database lock after %s attempts.", attempt)
                 return
