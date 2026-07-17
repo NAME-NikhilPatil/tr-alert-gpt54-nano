@@ -167,9 +167,12 @@ def main() -> int:
         test_live_gpt_defaults_bound_latency_and_concurrency,
         test_regression_dry_uses_the_http_retry_setting_read_by_the_client,
         test_valid_values_first_payload_does_not_retry_with_xhigh_by_default,
-        test_live_output_uses_only_generic_no_data_message_for_any_no_image_problem,
-        test_live_worker_logs_transport_detail_but_sends_only_generic_message,
+        test_live_output_silently_skips_any_no_image_problem,
+        test_live_worker_logs_transport_detail_without_telegram_message,
         test_live_worker_defers_generic_notice_when_transient_503_will_be_requeued,
+        test_financial_pipeline_non_financial_result_is_log_only,
+        test_telegram_sender_blocks_no_financial_data_text_at_transport_boundary,
+        test_telegram_queue_discards_old_no_financial_data_text,
         test_telegram_transport_errors_redact_bot_token,
         test_runtime_data_dir_moves_relative_state_under_persistent_root,
         test_no_telegram_status_is_not_reported_as_sent,
@@ -2855,7 +2858,7 @@ def test_valid_values_first_payload_does_not_retry_with_xhigh_by_default() -> No
         assert _should_retry_values_first_with_xhigh(payload) is False
 
 
-def test_live_output_uses_only_generic_no_data_message_for_any_no_image_problem() -> None:
+def test_live_output_silently_skips_any_no_image_problem() -> None:
     class Sender:
         def __init__(self) -> None:
             self.messages: list[str] = []
@@ -2895,13 +2898,11 @@ def test_live_output_uses_only_generic_no_data_message_for_any_no_image_problem(
         generated,
     )
 
-    assert sent == 1
-    assert sender.messages == [
-        "Example Limited\nSource: NSE\nFinancial data is not available in the PDF."
-    ]
+    assert sent == 0
+    assert sender.messages == []
 
 
-def test_live_worker_logs_transport_detail_but_sends_only_generic_message() -> None:
+def test_live_worker_logs_transport_detail_without_telegram_message() -> None:
     class Sender:
         def __init__(self) -> None:
             self.messages: list[str] = []
@@ -2952,10 +2953,7 @@ def test_live_worker_logs_transport_detail_but_sends_only_generic_message() -> N
             else:
                 raise AssertionError("terminal GPT failure must remain a failed job in logs")
 
-    assert sender.messages == [
-        "Example Limited\nSource: NSE\nFinancial data is not available in the PDF."
-    ]
-    assert all("503" not in message for message in sender.messages)
+    assert sender.messages == []
     failed_events = [details for event, details in runtime.events if event == "GPT_REQUEST_FAILED"]
     assert failed_events and "secret upstream HTTP 503" in str(failed_events[0].get("error"))
 
@@ -3020,6 +3018,74 @@ def test_live_worker_defers_generic_notice_when_transient_503_will_be_requeued()
     assert sender.messages == []
     notices = [details for event, details in runtime.events if event == "TELEGRAM_GENERIC_FAILURE_NOTICE"]
     assert notices and notices[0].get("retry_scheduled") is True
+
+
+def test_financial_pipeline_non_financial_result_is_log_only() -> None:
+    class Sender:
+        def __init__(self) -> None:
+            self.messages: list[str] = []
+
+        def send_text(self, message: str, *, queue_on_failure: bool = True) -> bool:
+            self.messages.append(message)
+            return True
+
+    sender = Sender()
+    announcement = Announcement(
+        source="BSE",
+        company_name="Example Limited",
+        identifier="example",
+        announcement_datetime="2026-07-17T10:00:00",
+        subject="Board Meeting Outcome",
+        pdf_url="https://example.test/example.pdf",
+    )
+
+    status = financial_pipeline_module._telegram_status_for_non_financial(
+        True,
+        {"parser_status": "skipped_non_financial_disclosure"},
+        announcement,
+        sender,
+    )
+
+    assert status == "live_skipped:no_financial_data"
+    assert sender.messages == []
+
+
+def test_telegram_sender_blocks_no_financial_data_text_at_transport_boundary() -> None:
+    sender = object.__new__(telegram_sender_module.TelegramSender)
+    sender.bot_token = "test-token"
+    sender.base_url = "https://api.telegram.org/bottest-token"
+    sender.chat_ids = ["test-chat"]
+
+    with patch.object(sender, "_post_with_retry") as post:
+        sent = sender.send_text(
+            "Example Limited\nSource: BSE\nFinancial data is not available in the PDF."
+        )
+
+    assert sent is False
+    post.assert_not_called()
+
+
+def test_telegram_queue_discards_old_no_financial_data_text() -> None:
+    sender = object.__new__(telegram_sender_module.TelegramSender)
+    sender.bot_token = "test-token"
+    sender.base_url = "https://api.telegram.org/bottest-token"
+    sender.chat_ids = ["test-chat"]
+
+    with TemporaryDirectory() as temp_dir:
+        queue_path = Path(temp_dir) / "telegram_queue.jsonl"
+        queue_path.write_text(
+            '{"kind":"text","chat_id":"test-chat","text":"Financial data is not available in the PDF."}\n',
+            encoding="utf-8",
+        )
+        with (
+            patch.object(telegram_sender_module, "QUEUE_PATH", queue_path),
+            patch.object(sender, "_post_with_retry") as post,
+        ):
+            sent = sender.drain_queue()
+
+        assert sent == 0
+        assert queue_path.read_text(encoding="utf-8") == ""
+        post.assert_not_called()
 
 
 def test_llm_values_first_blocks_total_income_component_mismatch() -> None:

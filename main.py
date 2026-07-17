@@ -689,27 +689,17 @@ def _process_live_pdf_job(
             and int(getattr(job, "attempt_count", 1) or 1) <= retry_limit
         )
         logging.exception(
-            "PDF processing failed for %s %s; detailed error stays in logs retry_scheduled=%s generic_notice_deferred=%s.",
+            "PDF processing failed for %s %s; detailed error stays in logs retry_scheduled=%s telegram_notice_suppressed=true.",
             announcement.source,
             announcement.company_name,
             retry_scheduled,
-            retry_scheduled,
         )
-        notice_sent = False
-        if sender is not None and not retry_scheduled:
-            try:
-                notice_sent = bool(sender.send_text(_no_financial_data_message(extraction, announcement)))
-            except Exception:
-                logging.exception(
-                    "Failed to send generic no-data Telegram message for %s %s.",
-                    announcement.source,
-                    announcement.company_name,
-                )
         runtime.log_event(
             "TELEGRAM_GENERIC_FAILURE_NOTICE",
             status="PROCESSING",
             telegram_enabled=sender is not None,
-            telegram_message_sent=notice_sent,
+            telegram_message_sent=False,
+            notice_suppressed=True,
             retry_scheduled=retry_scheduled,
         )
         raise
@@ -741,7 +731,7 @@ def _send_live_extraction_output(
         generated_images.warnings,
         generated_images.missing_sections,
     )
-    return 1 if sender.send_text(_no_financial_data_message(extraction, announcement)) else 0
+    return 0
 
 
 def _job_run_date(announcement: Announcement) -> date:

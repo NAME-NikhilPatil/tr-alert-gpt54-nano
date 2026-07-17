@@ -14,6 +14,13 @@ QUEUE_PATH = Path("logs") / "telegram_queue.jsonl"
 QUEUE_LOCK = threading.Lock()
 
 
+def _is_suppressed_no_financial_message(text: str) -> bool:
+    """Return whether a Telegram text is a no-financial-data notification."""
+
+    normalized = " ".join(str(text or "").lower().split())
+    return "financial data is not available" in normalized
+
+
 class TelegramSender:
     """Small Telegram Bot HTTP API client with retry and queue fallback."""
 
@@ -43,6 +50,9 @@ class TelegramSender:
     def send_text(self, text: str, *, queue_on_failure: bool = True) -> bool:
         """Send one Telegram text message."""
 
+        if _is_suppressed_no_financial_message(text):
+            logging.info("Telegram no-financial-data text suppressed; details remain in logs only.")
+            return False
         if not self.chat_ids:
             logging.warning("Telegram text skipped because there are no active subscribers.")
             return False
@@ -146,6 +156,9 @@ class TelegramSender:
                 kind = item.get("kind")
                 chat_id = str(item.get("chat_id", "")).strip()
                 target_chat_ids = [chat_id] if chat_id else self.chat_ids
+                if kind == "text" and _is_suppressed_no_financial_message(str(item.get("text", ""))):
+                    logging.info("Discarded queued Telegram no-financial-data text.")
+                    continue
                 if kind == "text" and self._send_text_to_chats(target_chat_ids, str(item.get("text", ""))):
                     sent += 1
                 elif kind == "document" and self._send_document_to_chats(
@@ -170,6 +183,9 @@ class TelegramSender:
     def _send_text_to_chats(self, chat_ids: list[str], text: str) -> bool:
         """Send text to a specific set of chat IDs without queueing."""
 
+        if _is_suppressed_no_financial_message(text):
+            logging.info("Telegram no-financial-data text suppressed; details remain in logs only.")
+            return False
         all_ok = True
         for chat_id in chat_ids:
             payload = {"chat_id": chat_id, "text": text}

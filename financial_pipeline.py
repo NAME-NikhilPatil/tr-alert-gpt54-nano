@@ -20,7 +20,6 @@ from financial_validation import attach_validation, validate_financial_payload
 from financial_filing_classifier import SKIPPED_NON_FINANCIAL_DISCLOSURE
 from financial_filing_classifier import analyze_financial_complexity
 from financial_filing_classifier import classify_pdf_filing
-from financial_filing_classifier import non_financial_skip_message
 from gpt54_extractor import (
     extract_pdf_with_gpt54,
     extract_structured_with_gpt54,
@@ -456,7 +455,7 @@ def _telegram_status_for_non_financial(
         return "disabled:no_send"
     if sender is None:
         return "live_skipped:credentials_missing"
-    return "live_sent:1" if sender.send_text(non_financial_skip_message(extraction), queue_on_failure=False) else "live_failed:non_financial_skip"
+    return "live_skipped:no_financial_data"
 
 
 def _should_run_validation_fallback(validation: Any, mock_apis: bool) -> bool:
